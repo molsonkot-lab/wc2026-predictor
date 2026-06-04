@@ -1,0 +1,22 @@
+# 缓存和数据库
+data/cache.db
+data/*.db
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.egg-info/
+
+# 本地 Streamlit secrets（不能上传！含 API Key）
+.streamlit/secrets.toml
+
+# Node（localtunnel）
+node_modules/
+package-lock.json
+package.json
+
+# 临时文件
+*.log
+.DS_Store
