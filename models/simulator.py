@@ -10,6 +10,9 @@ from models.elo import EloSystem
 from models.poisson_model import elo_to_lambdas, sample_score_fast
 from config import HOST_TEAMS, WC_HOST_ADVANTAGE
 
+# Type alias for H2H map: {(team_a_id, team_b_id): elo_adjustment_for_a}
+H2HMap = dict
+
 
 class GroupStandings:
     def __init__(self, teams: List[int]):
@@ -38,10 +41,12 @@ class GroupStandings:
 
 
 class TournamentSimulator:
-    def __init__(self, matches: List[Dict], teams: List[Dict], elo: EloSystem):
+    def __init__(self, matches: List[Dict], teams: List[Dict], elo: EloSystem,
+                 h2h_map: H2HMap = None):
         self.matches = matches
         self.teams = {t["id"]: t for t in teams}
         self.elo = elo
+        self.h2h_map: H2HMap = h2h_map or {}
         self.groups = self._build_groups()
 
     def _build_groups(self) -> Dict[str, List[int]]:
@@ -58,12 +63,17 @@ class TournamentSimulator:
     def _host_adv(self, team_id: int) -> float:
         return WC_HOST_ADVANTAGE if self.teams.get(team_id, {}).get("tla", "") in HOST_TEAMS else 0.0
 
+    def _h2h_adj(self, team_a: int, team_b: int) -> float:
+        """Elo adjustment for team_a when facing team_b based on H2H history."""
+        return self.h2h_map.get((team_a, team_b), 0.0)
+
     def _sim_match(self, home: int, away: int,
                    elo_overrides: Dict[int, float] = None) -> Tuple[int, int]:
         elo_overrides = elo_overrides or {}
         rh = elo_overrides.get(home, self.elo.get_rating(home))
         ra = elo_overrides.get(away, self.elo.get_rating(away))
-        lam, mu = elo_to_lambdas(rh, ra, self._host_adv(home))
+        adj = self._h2h_adj(home, away)
+        lam, mu = elo_to_lambdas(rh + adj, ra - adj, self._host_adv(home))
         return sample_score_fast(lam, mu)
 
     def _sim_knockout(self, a: int, b: int,
@@ -72,11 +82,12 @@ class TournamentSimulator:
         hg, ag = self._sim_match(a, b, elo_overrides)
         if hg != ag:
             return a if hg > ag else b
-        # Extra time
+        # Extra time — keep H2H bias
         elo_overrides = elo_overrides or {}
         rh = elo_overrides.get(a, self.elo.get_rating(a))
         ra = elo_overrides.get(b, self.elo.get_rating(b))
-        lam, mu = elo_to_lambdas(rh, ra)
+        adj = self._h2h_adj(a, b)
+        lam, mu = elo_to_lambdas(rh + adj, ra - adj)
         et_h = np.random.poisson(lam * 0.28)
         et_a = np.random.poisson(mu * 0.28)
         if et_h != et_a:

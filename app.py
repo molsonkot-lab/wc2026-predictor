@@ -15,6 +15,7 @@ from data.fetcher import (
     fetch_wc_matches, fetch_wc_teams, fetch_match_odds, fetch_outright_odds,
     build_odds_map, build_outright_map, get_fixed_results,
 )
+from data.h2h import build_h2h_map_from_cache, count_cached, fetch_all_h2h
 from data.players import get_key_players, compute_player_adjusted_elo, KEY_PLAYERS
 from models.elo import EloSystem
 from models.poisson_model import elo_to_lambdas, match_probabilities, most_likely_score
@@ -75,6 +76,12 @@ def run_sims(_sim, n, fixed_json, override_json):
     return _sim.run_simulations(n, fixed, override)
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def load_h2h_map(_matches_key, matches):
+    """Load H2H map from SQLite cache only — never blocks on API."""
+    return build_h2h_map_from_cache(matches)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Session state: player status overrides
 # ─────────────────────────────────────────────────────────────────────────────
@@ -121,6 +128,28 @@ odds_map  = build_odds_map(match_odds_raw)
 out_map   = build_outright_map(outright_raw)
 fixed     = get_fixed_results(matches)
 
+# H2H: instant load from cache (no API calls). Sidebar button triggers full fetch.
+h2h_map = load_h2h_map(id(matches), matches)
+_h2h_cached, _h2h_total = count_cached(matches)
+
+# Sidebar H2H status (rendered after matches are available)
+with st.sidebar:
+    st.markdown("---")
+    st.caption(f"📊 H2H 数据: {_h2h_cached}/{_h2h_total} 场已缓存")
+    if _h2h_cached < _h2h_total:
+        _remaining = _h2h_total - _h2h_cached
+        _est_min   = _remaining * 7 // 60 + 1
+        if st.button("📥 加载 H2H 数据", use_container_width=True,
+                     help=f"获取 {_remaining} 场历史对决数据（约 {_est_min} 分钟，一次性操作）"):
+            _pb = st.progress(0.0, text="正在加载历史对决数据...")
+            def _h2h_progress(done, total):
+                _pb.progress(done / total, text=f"H2H {done}/{total}...")
+            _n = fetch_all_h2h(matches, _h2h_progress)
+            _pb.empty()
+            st.cache_data.clear()
+            st.success(f"✅ 新获取 {_n} 场 H2H 数据")
+            st.rerun()
+
 # Build and update Elo
 elo = EloSystem()
 elo.initialize(teams)
@@ -139,7 +168,7 @@ for tid, t in team_map.items():
         elo_overrides[tid] = adj
 
 # Build simulator
-sim = TournamentSimulator(matches, teams, elo)
+sim = TournamentSimulator(matches, teams, elo, h2h_map=h2h_map)
 
 # Run Monte Carlo
 with st.spinner(f"运行 {n_sims:,} 次赛程模拟..."):
@@ -242,6 +271,10 @@ with tab1:
 # ═══════════════════════════════════════════════════════════════════
 with tab2:
     st.subheader("📊 小组赛 — 当前积分榜 & 晋级概率")
+    if _h2h_cached > 0:
+        st.caption(f"✅ 晋级概率已融合 {_h2h_cached} 场历史对决数据（±最高 40 Elo pts）")
+    else:
+        st.caption("ℹ️ 暂无 H2H 历史对决数据，点击侧边栏「加载 H2H 数据」可提升预测精度")
 
     groups = sim.groups
     group_letters = sorted(groups.keys())
