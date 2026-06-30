@@ -23,11 +23,15 @@ def predict_match(
     player_statuses: Dict[str, str],   # {player_name: "FIT"|"DOUBTFUL"|"OUT"}
     odds_probs: Optional[Tuple[float, float, float]] = None,  # from bookmaker
     home_adv_elo: float = 0.0,
+    odds_weight: Optional[float] = None,   # market blend weight (None → config default)
 ) -> Dict:
     """
     Returns a prediction dict with probabilities, expected score,
     most-likely score, and a human-readable reasoning string.
     """
+    from config import ODDS_BLEND_WEIGHT
+    w = ODDS_BLEND_WEIGHT if odds_weight is None else odds_weight
+
     base_elo_h = elo.get_rating(home_id)
     base_elo_a = elo.get_rating(away_id)
 
@@ -39,7 +43,7 @@ def predict_match(
 
     # Blend with market odds if available
     if odds_probs:
-        p_h, p_d, p_a = blend_with_odds((p_h, p_d, p_a), odds_probs)
+        p_h, p_d, p_a = blend_with_odds((p_h, p_d, p_a), odds_probs, weight=w)
 
     ml_home, ml_away = most_likely_score(lam, mu)
 

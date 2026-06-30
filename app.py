@@ -20,8 +20,22 @@ from data import predictions as plog
 from models.elo import EloSystem
 from models.simulator import TournamentSimulator
 from models.predictor import predict_match
+from models.poisson_model import most_likely_score
 from models.calibration import calibrate_elo_to_market
-from models.metaphysics import metaphysics_reading, apply_tilt
+from models.metaphysics import metaphysics_reading, apply_tilt, tilt_xg
+
+
+def _tuned_market_weight(default=0.7):
+    """Read the auto-tuned market_weight (written nightly by scripts/auto_tune.py)."""
+    try:
+        import json as _json
+        from pathlib import Path as _Path
+        p = _Path(__file__).parent / "tuned_params.json"
+        if p.exists():
+            return float(_json.loads(p.read_text()).get("market_weight", default))
+    except Exception:
+        pass
+    return default
 
 st.set_page_config(page_title="⚽ 2026世界杯预测", page_icon="⚽",
                    layout="centered", initial_sidebar_state="collapsed")
@@ -68,9 +82,11 @@ def run_sims(_sim, n, fixed_json, override_json):
 st.sidebar.title("⚙️ 设置")
 n_sims = st.sidebar.select_slider("模拟次数", options=[5_000, 10_000, 20_000],
                                   value=10_000, help="越高越精确，越慢")
+_mw_default = _tuned_market_weight()
 market_weight = st.sidebar.slider(
-    "市场锚定强度", 0.0, 1.0, 0.7, 0.1,
-    help="0=纯模型；1=完全贴合博彩夺冠赔率。推荐0.7。")
+    "市场锚定强度", 0.0, 1.0, _mw_default, 0.05,
+    help="0=纯模型；1=完全贴合博彩赔率。默认值由每晚自动调参(GitHub Actions)按真实战绩矫正。")
+st.sidebar.caption(f"🤖 当前自动调参建议值：{_mw_default:.2f}")
 mystic_strength = st.sidebar.slider(
     "🔮 玄学影响力", 0.0, 1.0, 0.0, 0.1,
     help="默认0=不影响真实预测。调大才让五行/风水/大运对概率施加偏置（纯娱乐）。")
@@ -183,31 +199,53 @@ with tab_match:
             home_tla=ht.get("tla", ""), away_tla=at.get("tla", ""),
             elo=elo, player_statuses=player_statuses, odds_probs=odds_pr,
             home_adv_elo=_host_adv(ht.get("tla", "")),
+            odds_weight=market_weight,          # 用自动调参后的市场权重
         )
 
-        # 玄学 tilt（默认 strength=0 时完全不改）
         reading = metaphysics_reading(h_name, a_name, m.get("venue", ""), m["utcDate"][:10])
-        p_h, p_d, p_a = apply_tilt(res["p_home"], res["p_draw"], res["p_away"],
-                                   reading["bias"], mystic_strength)
 
-        # 记录预测（仅首次，供日后复盘）
-        plog.log_prediction(m["id"], h_name, a_name, p_h, p_d, p_a,
-                            res["predicted_home"], res["predicted_away"], m["utcDate"])
+        # 纯模型（不加玄学）
+        base_p = (res["p_home"], res["p_draw"], res["p_away"])
+        base_score = (res["predicted_home"], res["predicted_away"])
+        # 加玄学（按当前玄学影响力强度，影响胜率 + 比分）
+        myst_p = apply_tilt(*base_p, reading["bias"], mystic_strength)
+        myst_score = most_likely_score(*tilt_xg(res["xg_home"], res["xg_away"],
+                                                reading["bias"], mystic_strength))
+
+        # 记录"不加玄学"的纯模型预测供复盘（玄学不应污染质检）
+        plog.log_prediction(m["id"], h_name, a_name, *base_p, *base_score, m["utcDate"])
 
         st.markdown(f"### {h_name} vs {a_name}")
-        c1, c2, c3 = st.columns(3)
-        c1.metric(f"{h_name} 胜", f"{p_h*100:.0f}%")
-        c2.metric("平局", f"{p_d*100:.0f}%")
-        c3.metric(f"{a_name} 胜", f"{p_a*100:.0f}%")
+        compare = st.toggle("🔮 对比：加玄学 vs 不加玄学", value=False,
+                            help="开启后并排显示两种结果；玄学强度由侧边栏🔮滑块控制")
 
-        st.metric("🎯 预测比分", f"{res['predicted_home']} : {res['predicted_away']}")
-        st.caption(f"预期进球 xG：{res['xg_home']:.2f} – {res['xg_away']:.2f}"
-                   + ("　|　含博彩赔率" if odds_pr else ""))
+        def _show(title, p, score):
+            st.caption(title)
+            c1, c2, c3 = st.columns(3)
+            c1.metric(f"{h_name} 胜", f"{p[0]*100:.0f}%")
+            c2.metric("平局", f"{p[1]*100:.0f}%")
+            c3.metric(f"{a_name} 胜", f"{p[2]*100:.0f}%")
+            st.metric("🎯 预测比分", f"{score[0]} : {score[1]}")
 
-        if mystic_strength > 0:
-            st.info(reading["verdict"])
+        if compare:
+            colL, colR = st.columns(2)
+            with colL:
+                _show("📊 不加玄学（纯模型）", base_p, base_score)
+            with colR:
+                _show("🔮 加玄学", myst_p, myst_score)
+            if mystic_strength == 0:
+                st.warning("玄学影响力为 0，两侧相同。把侧边栏 🔮 滑块调大才会看到差异。")
+            else:
+                dh = (myst_p[0] - base_p[0]) * 100
+                st.caption(f"玄学使 {h_name} 胜率变化 {dh:+.1f}%　|　{reading['verdict']}")
         else:
-            with st.expander("🔮 玄学一览（不影响上方数字）"):
+            # 单视图：按当前玄学强度展示（强度0即纯模型）
+            shown_p = myst_p if mystic_strength > 0 else base_p
+            shown_score = myst_score if mystic_strength > 0 else base_score
+            _show("胜平负预测", shown_p, shown_score)
+            st.caption(f"预期进球 xG：{res['xg_home']:.2f} – {res['xg_away']:.2f}"
+                       + ("　|　含博彩赔率" if odds_pr else ""))
+            with st.expander("🔮 玄学一览" + ("（已计入上方）" if mystic_strength > 0 else "（未计入）")):
                 st.write(reading["verdict"])
 
 # ════════════════════════ 复盘 ════════════════════════

@@ -1,0 +1,6 @@
+{
+  "market_weight": 0.7,
+  "n_samples": 0,
+  "note": "samples<5, keeping default to avoid overfit",
+  "updated_at": "2026-06-30T06:55:33.554118+00:00"
+}

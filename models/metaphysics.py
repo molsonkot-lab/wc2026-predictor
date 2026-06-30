@@ -120,3 +120,14 @@ def apply_tilt(p_home: float, p_draw: float, p_away: float,
     pd = max(1e-4, p_draw)
     tot = ph + pd + pa
     return ph / tot, pd / tot, pa / tot
+
+
+def tilt_xg(lam: float, mu: float, bias: float, strength: float) -> Tuple[float, float]:
+    """
+    按玄学 bias 与 strength 对预期进球(xG)施加偏置，用于让玄学也影响"预测比分"。
+    strength=0 时原样返回。bias>0 抬高主队进球、压低客队。
+    """
+    if strength <= 0 or bias == 0:
+        return lam, mu
+    f = bias * strength * 0.15
+    return max(0.1, lam * (1 + f)), max(0.1, mu * (1 - f))
