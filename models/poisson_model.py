@@ -82,5 +82,36 @@ def blend_with_odds(p_model: Tuple[float, float, float],
 
 
 def sample_score_fast(lam: float, mu: float) -> Tuple[int, int]:
-    """Fast Poisson sample (no DC correction) for Monte Carlo."""
+    """Fast independent Poisson sample (no dependence). Kept for compatibility."""
     return int(np.random.poisson(lam)), int(np.random.poisson(mu))
+
+
+from functools import lru_cache
+
+
+@lru_cache(maxsize=4096)
+def _dc_flat_cdf(lam_r: float, mu_r: float, rho: float) -> Tuple[np.ndarray, int]:
+    """
+    Cached flattened CDF of the Dixon-Coles score matrix for sampling.
+    lam_r/mu_r are rounded lambdas (grid) so the cache stays small but accurate.
+    Returns (cumulative_probs_1d, n) where n = MAX_GOALS+1.
+    """
+    M = score_matrix(lam_r, mu_r, rho)
+    return np.cumsum(M.ravel()), M.shape[0]
+
+
+def sample_score_dc(lam: float, mu: float, rho: float = DC_RHO) -> Tuple[int, int]:
+    """
+    Sample an exact scoreline from the Dixon-Coles bivariate distribution.
+
+    Unlike independent Poisson, this captures the empirically-observed
+    dependence between home and away goals (the low-score correction of
+    Dixon & Coles 1997; consistent with the copula / dependence literature,
+    e.g. Petretta 2025, PARX-Copula). Cached on a 0.05-goal grid for speed so
+    a full tournament Monte Carlo stays fast.
+    """
+    lam_r = round(min(4.5, max(0.3, lam)) * 20) / 20.0
+    mu_r  = round(min(4.5, max(0.3, mu))  * 20) / 20.0
+    cdf, n = _dc_flat_cdf(lam_r, mu_r, rho)
+    idx = int(np.searchsorted(cdf, np.random.random() * cdf[-1]))
+    return divmod(idx, n)

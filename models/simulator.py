@@ -7,7 +7,7 @@ from typing import Dict, List, Tuple, Optional
 from collections import defaultdict
 
 from models.elo import EloSystem
-from models.poisson_model import elo_to_lambdas, sample_score_fast
+from models.poisson_model import elo_to_lambdas, sample_score_dc
 from config import HOST_TEAMS, WC_HOST_ADVANTAGE
 
 # Type alias for H2H map: {(team_a_id, team_b_id): elo_adjustment_for_a}
@@ -74,7 +74,7 @@ class TournamentSimulator:
         ra = elo_overrides.get(away, self.elo.get_rating(away))
         adj = self._h2h_adj(home, away)
         lam, mu = elo_to_lambdas(rh + adj, ra - adj, self._host_adv(home))
-        return sample_score_fast(lam, mu)
+        return sample_score_dc(lam, mu)
 
     def _sim_knockout(self, a: int, b: int,
                       elo_overrides: Dict[int, float] = None) -> int:
@@ -200,22 +200,17 @@ class TournamentSimulator:
 
         counts = defaultdict(lambda: [0] * 7)
         # index: 0=group_only, 1=r32, 2=r16, 3=qf, 4=sf, 5=final, 6=champion
+        # counts[tid][lvl] = number of sims in which the team's deepest stage was exactly `lvl`.
 
         for _ in range(n):
             result = self.simulate_once(fixed, overrides)
-            for tid, lvl in result["progression"].items():
-                for k in range(lvl + 1):
-                    counts[tid][k] += 1
-                # fix: count the exact level
-            # Simpler: just accumulate counts per stage reached
             for tid, lvl in result["progression"].items():
                 counts[tid][lvl] += 1
 
         probs = {}
         for tid in self.teams:
             c = counts[tid]
-            total = sum(c)
-            # Cumulative "reached at least stage X"
+            # Cumulative "reached at least stage X" = sum of exact counts at >= X.
             cum = [0.0] * 7
             running = 0
             for i in range(6, -1, -1):

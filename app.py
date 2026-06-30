@@ -1,612 +1,234 @@
 """
-FIFA World Cup 2026 — Prediction Dashboard
-Elo + Dixon-Coles Poisson + Monte Carlo + Player factors + Odds blending
+FIFA World Cup 2026 — 预测看板（极简版）
+胜平负 + 比分 + 冠军，移动端友好。
+模型：Elo + Dixon-Coles(进球相关性) + 蒙特卡洛 + 市场赔率锚定 + 玄学(可选)。
 """
-import streamlit as st
-import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
-import numpy as np
 import json
 from datetime import datetime, timezone
 
-from config import N_SIMULATIONS, HOST_TEAMS, WC_HOST_ADVANTAGE
+import streamlit as st
+import pandas as pd
+import plotly.express as px
+
+from config import HOST_TEAMS, WC_HOST_ADVANTAGE
 from data.fetcher import (
     fetch_wc_matches, fetch_wc_teams, fetch_match_odds, fetch_outright_odds,
     build_odds_map, build_outright_map, get_fixed_results,
 )
-from data.h2h import build_h2h_map_from_cache, count_cached, fetch_all_h2h
-from data.players import get_key_players, compute_player_adjusted_elo, KEY_PLAYERS
+from data.players import compute_player_adjusted_elo, KEY_PLAYERS
+from data import predictions as plog
 from models.elo import EloSystem
-from models.poisson_model import elo_to_lambdas, match_probabilities, most_likely_score
 from models.simulator import TournamentSimulator
 from models.predictor import predict_match
+from models.calibration import calibrate_elo_to_market
+from models.metaphysics import metaphysics_reading, apply_tilt
 
-# ─────────────────────────────────────────────────────────────────────────────
-st.set_page_config(
-    page_title="⚽ 2026 世界杯预测",
-    page_icon="⚽",
-    layout="wide",
-    initial_sidebar_state="collapsed",   # 手机上默认折叠侧边栏
-)
+st.set_page_config(page_title="⚽ 2026世界杯预测", page_icon="⚽",
+                   layout="centered", initial_sidebar_state="collapsed")
 
-# 移动端适配 CSS
+# ── 移动端紧凑样式 ──────────────────────────────────────────────
 st.markdown("""
 <style>
-  /* 手机上让表格可横向滚动 */
-  .stDataFrame { overflow-x: auto !important; }
-  /* 小屏幕减少内边距 */
-  @media (max-width: 768px) {
-    .block-container { padding: 0.5rem 0.8rem !important; }
-    h1 { font-size: 1.4rem !important; }
-    h2 { font-size: 1.1rem !important; }
-    h3 { font-size: 1.0rem !important; }
-    /* 侧边栏按钮更大，手机更好点 */
-    .stButton > button { min-height: 48px; font-size: 1rem; }
-    /* tab 字体稍小 */
-    .stTabs [data-baseweb="tab"] { font-size: 0.78rem; padding: 6px 8px; }
-  }
-  /* 进度条颜色 */
-  .stProgress > div > div { background-color: #00a651; }
+.block-container {padding-top: 1.2rem; padding-bottom: 2rem; max-width: 720px;}
+[data-testid="stMetricValue"] {font-size: 1.4rem;}
+h1 {font-size: 1.5rem !important;}
 </style>
 """, unsafe_allow_html=True)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Data loading (cached)
-# ─────────────────────────────────────────────────────────────────────────────
 
+# ── 数据加载（缓存）─────────────────────────────────────────────
 @st.cache_data(ttl=600, show_spinner=False)
-def load_base_data():
-    matches = fetch_wc_matches()
-    teams   = fetch_wc_teams()
-    return matches, teams
+def load_base():
+    return fetch_wc_matches(), fetch_wc_teams()
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def load_odds_data():
-    match_odds   = fetch_match_odds()
-    outright     = fetch_outright_odds()
-    return match_odds, outright
+def load_odds():
+    return fetch_match_odds(), fetch_outright_odds()
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def calibrate(_sim, _team_map, out_json, base_json, fixed_json, weight):
+    out_map = json.loads(out_json)
+    base    = {int(k): v        for k, v in json.loads(base_json).items()}
+    fixed   = {int(k): tuple(v) for k, v in json.loads(fixed_json).items()}
+    return calibrate_elo_to_market(_sim, out_map, _team_map,
+                                   market_weight=weight, base_overrides=base,
+                                   fixed_results=fixed)
 
 
 @st.cache_data(ttl=600, show_spinner=False)
 def run_sims(_sim, n, fixed_json, override_json):
     fixed    = {int(k): tuple(v) for k, v in json.loads(fixed_json).items()}
-    override = {int(k): v       for k, v in json.loads(override_json).items()}
+    override = {int(k): v        for k, v in json.loads(override_json).items()}
     return _sim.run_simulations(n, fixed, override)
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def load_h2h_map(_matches_key, matches):
-    """Load H2H map from SQLite cache only — never blocks on API."""
-    return build_h2h_map_from_cache(matches)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Session state: player status overrides
-# ─────────────────────────────────────────────────────────────────────────────
-
-if "player_statuses" not in st.session_state:
-    # Initialise from registry defaults
-    st.session_state.player_statuses = {}
-    for tla, players in KEY_PLAYERS.items():
-        for p in players:
-            st.session_state.player_statuses[p["name"]] = p["status"]
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Sidebar
-# ─────────────────────────────────────────────────────────────────────────────
-
-st.sidebar.title("⚽ WC2026 预测")
-st.sidebar.markdown("---")
-
-n_sims = st.sidebar.select_slider(
-    "模拟次数", options=[10_000, 20_000, 50_000], value=20_000,
-    help="次数越高越精确，但计算越慢"
-)
-
-if st.sidebar.button("🔄 刷新实时数据", type="primary", use_container_width=True):
+# ── 侧边栏控制 ─────────────────────────────────────────────────
+st.sidebar.title("⚙️ 设置")
+n_sims = st.sidebar.select_slider("模拟次数", options=[5_000, 10_000, 20_000],
+                                  value=10_000, help="越高越精确，越慢")
+market_weight = st.sidebar.slider(
+    "市场锚定强度", 0.0, 1.0, 0.7, 0.1,
+    help="0=纯模型；1=完全贴合博彩夺冠赔率。推荐0.7。")
+mystic_strength = st.sidebar.slider(
+    "🔮 玄学影响力", 0.0, 1.0, 0.0, 0.1,
+    help="默认0=不影响真实预测。调大才让五行/风水/大运对概率施加偏置（纯娱乐）。")
+if st.sidebar.button("🔄 刷新实时数据", use_container_width=True):
     fetch_wc_matches(force_refresh=True)
     fetch_match_odds(force_refresh=True)
     fetch_outright_odds(force_refresh=True)
     st.cache_data.clear()
     st.rerun()
+st.sidebar.caption(f"更新: {datetime.now(timezone.utc):%Y-%m-%d %H:%M} UTC")
 
-st.sidebar.markdown("---")
-st.sidebar.caption(f"更新时间: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC")
+# ── 加载与建模 ─────────────────────────────────────────────────
+with st.spinner("加载数据..."):
+    matches, teams = load_base()
+    match_odds_raw, outright_raw = load_odds()
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Load all data
-# ─────────────────────────────────────────────────────────────────────────────
+team_map = {t["id"]: t for t in teams}
+odds_map = build_odds_map(match_odds_raw)
+out_map  = build_outright_map(outright_raw)
+fixed    = get_fixed_results(matches)
 
-with st.spinner("加载赛程与赔率数据..."):
-    matches, teams = load_base_data()
-    match_odds_raw, outright_raw = load_odds_data()
-
-team_map  = {t["id"]: t for t in teams}
-odds_map  = build_odds_map(match_odds_raw)
-out_map   = build_outright_map(outright_raw)
-fixed     = get_fixed_results(matches)
-
-# H2H: instant load from cache (no API calls). Sidebar button triggers full fetch.
-h2h_map = load_h2h_map(id(matches), matches)
-_h2h_cached, _h2h_total = count_cached(matches)
-
-# Sidebar H2H status (rendered after matches are available)
-with st.sidebar:
-    st.markdown("---")
-    st.caption(f"📊 H2H 数据: {_h2h_cached}/{_h2h_total} 场已缓存")
-    if _h2h_cached < _h2h_total:
-        _remaining = _h2h_total - _h2h_cached
-        _est_min   = _remaining * 7 // 60 + 1
-        if st.button("📥 加载 H2H 数据", use_container_width=True,
-                     help=f"获取 {_remaining} 场历史对决数据（约 {_est_min} 分钟，一次性操作）"):
-            _pb = st.progress(0.0, text="正在加载历史对决数据...")
-            def _h2h_progress(done, total):
-                _pb.progress(done / total, text=f"H2H {done}/{total}...")
-            _n = fetch_all_h2h(matches, _h2h_progress)
-            _pb.empty()
-            st.cache_data.clear()
-            st.success(f"✅ 新获取 {_n} 场 H2H 数据")
-            st.rerun()
-
-# Build and update Elo
+# Elo（含已结束比赛的更新）
 elo = EloSystem()
 elo.initialize(teams)
 for m in sorted(matches, key=lambda x: x["utcDate"]):
-    if m["status"] == "FINISHED":
+    if m["status"] == "FINISHED" and m["id"] in fixed:
         hg, ag = fixed[m["id"]]
         elo.update(m["homeTeam"]["id"], m["awayTeam"]["id"], hg, ag, m.get("stage", "GROUP_STAGE"))
 
-# Build player-adjusted Elo overrides
-elo_overrides = {}
+# 球员伤停调整
+player_statuses = {p["name"]: p["status"] for ps in KEY_PLAYERS.values() for p in ps}
+base_overrides = {}
 for tid, t in team_map.items():
-    tla = t.get("tla", "")
-    base = elo.get_rating(tid)
-    adj  = compute_player_adjusted_elo(base, tla, st.session_state.player_statuses)
-    if abs(adj - base) > 0.5:
-        elo_overrides[tid] = adj
+    adj = compute_player_adjusted_elo(elo.get_rating(tid), t.get("tla", ""), player_statuses)
+    if abs(adj - elo.get_rating(tid)) > 0.5:
+        base_overrides[tid] = adj
 
-# Build simulator
-sim = TournamentSimulator(matches, teams, elo, h2h_map=h2h_map)
+sim = TournamentSimulator(matches, teams, elo)
+fixed_json = json.dumps({str(k): list(v) for k, v in fixed.items()})
 
-# Run Monte Carlo
+# 市场锚定 → 校准后的 Elo
+with st.spinner("市场赔率校准中..."):
+    if out_map and market_weight > 0:
+        overrides, cal_info = calibrate(
+            sim, team_map, json.dumps(out_map),
+            json.dumps({str(k): v for k, v in base_overrides.items()}),
+            fixed_json, market_weight)
+    else:
+        overrides, cal_info = base_overrides, {"status": "skipped"}
+
 with st.spinner(f"运行 {n_sims:,} 次赛程模拟..."):
-    probs = run_sims(
-        sim, n_sims,
-        json.dumps({str(k): list(v) for k, v in fixed.items()}),
-        json.dumps({str(k): v       for k, v in elo_overrides.items()}),
-    )
+    probs = run_sims(sim, n_sims, fixed_json,
+                     json.dumps({str(k): v for k, v in overrides.items()}))
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Build master dataframe
-# ─────────────────────────────────────────────────────────────────────────────
+st.title("⚽ 2026 世界杯预测")
 
-rows = []
-for tid, t in team_map.items():
-    p   = probs.get(tid, {})
-    tla = t.get("tla", "")
-    elo_val = elo_overrides.get(tid, elo.get_rating(tid))
-    out_prob = out_map.get(t["name"].lower())
-    rows.append({
-        "team_id":      tid,
-        "Team":         t["name"],
-        "TLA":          tla,
-        "Elo":          round(elo_val),
-        "冠军概率%":     round(p.get("win", 0)           * 100, 1),
-        "进决赛%":       round(p.get("final", 0)         * 100, 1),
-        "进四强%":       round(p.get("sf", 0)            * 100, 1),
-        "进八强%":       round(p.get("qf", 0)            * 100, 1),
-        "进16强%":       round(p.get("r16", 0)           * 100, 1),
-        "出线%":         round(p.get("group_qualify", 0) * 100, 1),
-        "赔率冠军概率%": round(out_prob * 100, 1) if out_prob else None,
-    })
+tab_champ, tab_match, tab_review = st.tabs(["🏆 冠军", "⚽ 比赛预测", "📊 复盘"])
 
-df = pd.DataFrame(rows).sort_values("冠军概率%", ascending=False).reset_index(drop=True)
-df.index += 1
+# ════════════════════════ 冠军预测 ════════════════════════
+with tab_champ:
+    champ_rows = []
+    for tid, t in team_map.items():
+        p = probs.get(tid, {})
+        champ_rows.append({
+            "球队": t.get("name", "?"),
+            "夺冠%": round(p.get("win", 0) * 100, 1),
+            "出线%": round(p.get("group_qualify", 0) * 100, 0),
+        })
+    cdf = pd.DataFrame(champ_rows).sort_values("夺冠%", ascending=False).reset_index(drop=True)
+    top = cdf.head(12)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Page header
-# ─────────────────────────────────────────────────────────────────────────────
-
-st.title("⚽ FIFA 世界杯 2026 — 智能预测看板")
-col_h1, col_h2, col_h3, col_h4 = st.columns(4)
-col_h1.metric("已进行比赛", len(fixed))
-col_h2.metric("剩余比赛", len([m for m in matches if m["status"] != "FINISHED"]))
-col_h3.metric("模拟次数", f"{n_sims:,}")
-col_h4.metric("当前冠军大热", df.iloc[0]["Team"] if len(df) else "—")
-
-st.markdown("---")
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Tabs
-# ─────────────────────────────────────────────────────────────────────────────
-
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-    "🏆 冠军赔率",
-    "📊 小组赛",
-    "🎯 比赛预测",
-    "📈 赛程路径",
-    "👥 球员状态",
-    "🔢 完整排名",
-])
-
-# ═══════════════════════════════════════════════════════════════════
-# TAB 1: Championship Odds
-# ═══════════════════════════════════════════════════════════════════
-with tab1:
-    st.subheader("🏆 冠军概率（蒙特卡洛 × 次模拟）")
-
-    top20 = df.head(20).copy()
-
-    fig = px.bar(
-        top20, x="Team", y="冠军概率%",
-        color="冠军概率%",
-        color_continuous_scale="Viridis",
-        text="冠军概率%",
-        title="夺冠概率 Top 20",
-    )
-    fig.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
-    fig.update_layout(height=480, xaxis_tickangle=-40, showlegend=False,
-                      coloraxis_showscale=False)
+    fig = px.bar(top[::-1], x="夺冠%", y="球队", orientation="h",
+                 text="夺冠%", color="夺冠%", color_continuous_scale="YlOrRd")
+    fig.update_traces(texttemplate="%{text}%", textposition="outside")
+    fig.update_layout(height=440, margin=dict(l=0, r=10, t=10, b=0),
+                      coloraxis_showscale=False, yaxis_title="", xaxis_title="夺冠概率 %")
     st.plotly_chart(fig, use_container_width=True)
 
-    # Comparison with bookmaker odds
-    cmp = df[df["赔率冠军概率%"].notna()][
-        ["Team", "冠军概率%", "赔率冠军概率%", "Elo"]
-    ].head(16).copy()
-    if not cmp.empty:
-        st.subheader("模型 vs 赌盘对比")
-        fig2 = go.Figure()
-        fig2.add_trace(go.Bar(name="模型预测", x=cmp["Team"], y=cmp["冠军概率%"],
-                              marker_color="steelblue"))
-        fig2.add_trace(go.Bar(name="赌盘赔率", x=cmp["Team"], y=cmp["赔率冠军概率%"],
-                              marker_color="tomato"))
-        fig2.update_layout(barmode="group", height=400, xaxis_tickangle=-40,
-                           title="模型 vs 赌盘冠军概率比较 (%)")
-        st.plotly_chart(fig2, use_container_width=True)
+    champ = cdf.iloc[0]
+    st.success(f"🥇 夺冠热门：**{champ['球队']}**（{champ['夺冠%']}%）")
+    if market_weight > 0 and cal_info.get("status") == "ok":
+        st.caption(f"已用博彩赔率校准（锚定强度 {market_weight:.1f}，覆盖 {cal_info.get('resolved',0)} 队）")
+    with st.expander("完整夺冠榜"):
+        st.dataframe(cdf, use_container_width=True, hide_index=True, height=400)
 
-# ═══════════════════════════════════════════════════════════════════
-# TAB 2: Group Stage
-# ═══════════════════════════════════════════════════════════════════
-with tab2:
-    st.subheader("📊 小组赛 — 当前积分榜 & 晋级概率")
-    if _h2h_cached > 0:
-        st.caption(f"✅ 晋级概率已融合 {_h2h_cached} 场历史对决数据（±最高 40 Elo pts）")
+# ════════════════════════ 比赛预测 ════════════════════════
+with tab_match:
+    def _host_adv(tla):
+        return WC_HOST_ADVANTAGE if tla in HOST_TEAMS else 0.0
+
+    upcoming = [m for m in matches if m["status"] != "FINISHED"
+                and m["homeTeam"].get("id") and m["awayTeam"].get("id")]
+    upcoming.sort(key=lambda x: x["utcDate"])
+
+    if not upcoming:
+        st.info("暂无待预测的比赛。")
     else:
-        st.caption("ℹ️ 暂无 H2H 历史对决数据，点击侧边栏「加载 H2H 数据」可提升预测精度")
+        labels = []
+        for m in upcoming[:60]:
+            d = m["utcDate"][:10]
+            labels.append(f"{d} | {m['homeTeam'].get('name','?')} vs {m['awayTeam'].get('name','?')}")
+        sel = st.selectbox("选择比赛", labels)
+        m = upcoming[labels.index(sel)]
 
-    groups = sim.groups
-    group_letters = sorted(groups.keys())
-
-    for row_start in range(0, len(group_letters), 3):
-        cols = st.columns(3)
-        for ci, g in enumerate(group_letters[row_start:row_start + 3]):
-            with cols[ci]:
-                letter = g.replace("GROUP_", "")
-                st.markdown(f"#### 第 {letter} 组")
-                g_rows = []
-                for tid in groups[g]:
-                    t = team_map.get(tid, {})
-                    p = probs.get(tid, {})
-                    tla = t.get("tla", "")
-                    adj_elo = elo_overrides.get(tid, elo.get_rating(tid))
-                    # Count actual played matches
-                    gp = sum(
-                        1 for m in matches
-                        if m["status"] == "FINISHED" and m.get("group") == g
-                        and (m["homeTeam"].get("id") == tid or m["awayTeam"].get("id") == tid)
-                    )
-                    pts_actual = 0
-                    for m in matches:
-                        if m["status"] != "FINISHED" or m.get("group") != g:
-                            continue
-                        hid = m["homeTeam"].get("id")
-                        aid = m["awayTeam"].get("id")
-                        sc = m["score"]["fullTime"]
-                        hg, ag = sc.get("home", 0) or 0, sc.get("away", 0) or 0
-                        if hid == tid:
-                            pts_actual += 3 if hg > ag else (1 if hg == ag else 0)
-                        elif aid == tid:
-                            pts_actual += 3 if ag > hg else (1 if ag == hg else 0)
-
-                    g_rows.append({
-                        "球队":     t.get("shortName", t.get("name", "")),
-                        "Elo":      round(adj_elo),
-                        "已赛":     gp,
-                        "积分":     pts_actual,
-                        "出线%":    f"{p.get('group_qualify',0)*100:.0f}%",
-                    })
-
-                g_rows.sort(key=lambda x: (-x["积分"], -x["Elo"]))
-                gdf = pd.DataFrame(g_rows)
-                st.dataframe(gdf, use_container_width=True, hide_index=True, height=180)
-
-# ═══════════════════════════════════════════════════════════════════
-# TAB 3: Match Predictions
-# ═══════════════════════════════════════════════════════════════════
-with tab3:
-    st.subheader("🎯 比赛预测与分析")
-
-    col_f1, col_f2, col_f3 = st.columns(3)
-    with col_f1:
-        show_played = st.checkbox("显示已完赛", value=False)
-    with col_f2:
-        stage_opts = ["全部", "GROUP_STAGE", "ROUND_OF_32", "ROUND_OF_16",
-                      "QUARTER_FINALS", "SEMI_FINALS", "FINAL"]
-        stage_filter = st.selectbox("阶段筛选", stage_opts)
-    with col_f3:
-        days_ahead = st.slider("显示未来几天比赛", 1, 7, 3)
-
-    now = datetime.now(timezone.utc)
-    pred_rows = []
-    for m in sorted(matches, key=lambda x: x["utcDate"]):
-        if m["status"] == "FINISHED" and not show_played:
-            continue
-        if stage_filter != "全部" and m.get("stage") != stage_filter:
-            continue
-
-        home_id = m["homeTeam"].get("id")
-        away_id = m["awayTeam"].get("id")
-        if not home_id or not away_id:
-            continue
-
-        ht = team_map.get(home_id, {})
-        at = team_map.get(away_id, {})
-        home_tla = ht.get("tla", "")
-        away_tla = at.get("tla", "")
-
-        adj_h = elo_overrides.get(home_id, elo.get_rating(home_id))
-        adj_a = elo_overrides.get(away_id, elo.get_rating(away_id))
-
-        host_adv = WC_HOST_ADVANTAGE if home_tla in HOST_TEAMS else 0.0
-        lam, mu = elo_to_lambdas(adj_h, adj_a, host_adv)
-
-        # Match odds
-        name_key = frozenset([ht.get("name", ""), at.get("name", "")])
-        odds_pr = None
-        for ok, ov in odds_map.items():
-            if ok == name_key:
-                odds_pr = ov
-                break
-        # Also try short name
-        short_key = frozenset([ht.get("shortName", ""), at.get("shortName", "")])
-        if odds_pr is None:
-            for ok, ov in odds_map.items():
-                if ok == short_key:
-                    odds_pr = ov
-                    break
-
-        p_h, p_d, p_a = match_probabilities(lam, mu)
-        if odds_pr:
-            from models.poisson_model import blend_with_odds
-            p_h, p_d, p_a = blend_with_odds((p_h, p_d, p_a), odds_pr)
-
-        ml_h, ml_a = most_likely_score(lam, mu)
-        date_str = m["utcDate"][:10]
-        stage_label = m.get("stage", "").replace("_", " ").title()
-        group_label = m.get("group", "").replace("GROUP_", "组 ") if m.get("group") else stage_label
-
-        result_str = ""
-        outcome_icon = ""
-        if m["status"] == "FINISHED":
-            sc = m["score"]["fullTime"]
-            result_str = f"{sc.get('home',0)} – {sc.get('away',0)}"
-
-        pred_rows.append({
-            "日期":       date_str,
-            "阶段":       group_label,
-            "主队":       ht.get("shortName", ht.get("name", "?")),
-            "主队胜%":    f"{p_h*100:.0f}%",
-            "平局%":      f"{p_d*100:.0f}%",
-            "客队胜%":    f"{p_a*100:.0f}%",
-            "客队":       at.get("shortName", at.get("name", "?")),
-            "预测比分":   f"{ml_h}:{ml_a}",
-            "实际比分":   result_str,
-            "xG主/客":    f"{lam:.2f}/{mu:.2f}",
-            "有赔率":     "✅" if odds_pr else "—",
-            "_home_id":   home_id,
-            "_away_id":   away_id,
-            "_home_tla":  home_tla,
-            "_away_tla":  away_tla,
-            "_home_name": ht.get("name", ""),
-            "_away_name": at.get("name", ""),
-            "_odds_pr":   odds_pr,
-            "_adj_h":     adj_h,
-            "_adj_a":     adj_a,
-            "_host_adv":  host_adv,
-        })
-
-    display_cols = ["日期","阶段","主队","主队胜%","平局%","客队胜%","客队","预测比分","实际比分","xG主/客","有赔率"]
-    pdf_display = pd.DataFrame(pred_rows)[display_cols] if pred_rows else pd.DataFrame()
-
-    if not pdf_display.empty:
-        st.dataframe(pdf_display, use_container_width=True, height=520, hide_index=True)
-    else:
-        st.info("没有符合条件的比赛。")
-
-    # ── Detailed prediction for a single match ──
-    st.markdown("---")
-    st.subheader("🔍 单场深度分析")
-
-    upcoming = [r for r in pred_rows if not r["实际比分"]]
-    if upcoming:
-        match_labels = [f"{r['日期']} | {r['主队']} vs {r['客队']} [{r['阶段']}]" for r in upcoming]
-        sel = st.selectbox("选择比赛", match_labels)
-        sel_idx = match_labels.index(sel)
-        r = upcoming[sel_idx]
-
-        result = predict_match(
-            home_id=r["_home_id"], away_id=r["_away_id"],
-            home_name=r["_home_name"], away_name=r["_away_name"],
-            home_tla=r["_home_tla"], away_tla=r["_away_tla"],
-            elo=elo,
-            player_statuses=st.session_state.player_statuses,
-            odds_probs=r["_odds_pr"],
-            home_adv_elo=r["_host_adv"],
+        ht, at = m["homeTeam"], m["awayTeam"]
+        h_name, a_name = ht.get("name", "?"), at.get("name", "?")
+        odds_pr = odds_map.get(frozenset([h_name, a_name]))
+        res = predict_match(
+            home_id=ht["id"], away_id=at["id"], home_name=h_name, away_name=a_name,
+            home_tla=ht.get("tla", ""), away_tla=at.get("tla", ""),
+            elo=elo, player_statuses=player_statuses, odds_probs=odds_pr,
+            home_adv_elo=_host_adv(ht.get("tla", "")),
         )
 
-        col_a, col_b, col_c = st.columns(3)
-        col_a.metric(f"{r['_home_name']} 胜", f"{result['p_home']*100:.1f}%")
-        col_b.metric("平局", f"{result['p_draw']*100:.1f}%")
-        col_c.metric(f"{r['_away_name']} 胜", f"{result['p_away']*100:.1f}%")
+        # 玄学 tilt（默认 strength=0 时完全不改）
+        reading = metaphysics_reading(h_name, a_name, m.get("venue", ""), m["utcDate"][:10])
+        p_h, p_d, p_a = apply_tilt(res["p_home"], res["p_draw"], res["p_away"],
+                                   reading["bias"], mystic_strength)
 
-        col_d, col_e = st.columns(2)
-        col_d.metric("预期比分 (xG)", f"{result['xg_home']:.2f} – {result['xg_away']:.2f}")
-        col_e.metric("最大概率比分", f"{result['predicted_home']} – {result['predicted_away']}")
+        # 记录预测（仅首次，供日后复盘）
+        plog.log_prediction(m["id"], h_name, a_name, p_h, p_d, p_a,
+                            res["predicted_home"], res["predicted_away"], m["utcDate"])
 
-        with st.expander("📋 完整预测分析", expanded=True):
-            st.markdown(result["reasoning"])
+        st.markdown(f"### {h_name} vs {a_name}")
+        c1, c2, c3 = st.columns(3)
+        c1.metric(f"{h_name} 胜", f"{p_h*100:.0f}%")
+        c2.metric("平局", f"{p_d*100:.0f}%")
+        c3.metric(f"{a_name} 胜", f"{p_a*100:.0f}%")
 
-# ═══════════════════════════════════════════════════════════════════
-# TAB 4: Tournament Path
-# ═══════════════════════════════════════════════════════════════════
-with tab4:
-    st.subheader("📈 各队赛程晋级路径概率")
+        st.metric("🎯 预测比分", f"{res['predicted_home']} : {res['predicted_away']}")
+        st.caption(f"预期进球 xG：{res['xg_home']:.2f} – {res['xg_away']:.2f}"
+                   + ("　|　含博彩赔率" if odds_pr else ""))
 
-    stage_labels = ["出线%", "进16强%", "进八强%", "进四强%", "进决赛%", "冠军概率%"]
-    stage_keys   = ["group_qualify", "r16", "qf", "sf", "final", "win"]
+        if mystic_strength > 0:
+            st.info(reading["verdict"])
+        else:
+            with st.expander("🔮 玄学一览（不影响上方数字）"):
+                st.write(reading["verdict"])
 
-    top_n = st.slider("显示前 N 支球队", 4, 16, 8)
-    top_teams = df.head(top_n)
-
-    fig_path = go.Figure()
-    for _, row in top_teams.iterrows():
-        tid = row["team_id"]
-        p   = probs.get(tid, {})
-        y_vals = [p.get(k, 0) * 100 for k in stage_keys]
-        fig_path.add_trace(go.Scatter(
-            x=stage_labels, y=y_vals,
-            mode="lines+markers",
-            name=row["Team"],
-            line=dict(width=2),
-        ))
-
-    fig_path.update_layout(
-        title="各阶段晋级概率（%）",
-        yaxis_title="概率 (%)",
-        height=480,
-        legend=dict(orientation="v"),
-        hovermode="x unified",
-    )
-    st.plotly_chart(fig_path, use_container_width=True)
-
-    # Heatmap
-    st.subheader("热力图 — Top 20 队伍 × 各阶段")
-    top20_ids = df.head(20)["team_id"].tolist()
-    top20_names = df.head(20)["Team"].tolist()
-    heat_data = []
-    for tid in top20_ids:
-        p = probs.get(tid, {})
-        heat_data.append([round(p.get(k, 0) * 100, 1) for k in stage_keys])
-
-    fig_heat = px.imshow(
-        heat_data,
-        x=stage_labels, y=top20_names,
-        color_continuous_scale="YlGn",
-        aspect="auto",
-        title="晋级概率热力图 (%)",
-        text_auto=True,
-    )
-    fig_heat.update_layout(height=580)
-    st.plotly_chart(fig_heat, use_container_width=True)
-
-# ═══════════════════════════════════════════════════════════════════
-# TAB 5: Player Status
-# ═══════════════════════════════════════════════════════════════════
-with tab5:
-    st.subheader("👥 核心球员状态管理")
-    st.info("修改球员状态后，预测将自动重新计算。伤号、停赛球员会降低对应队伍的 Elo 评分。")
-
-    tla_options = sorted(KEY_PLAYERS.keys())
-    team_names_by_tla = {t.get("tla", ""): t["name"] for t in teams}
-
-    sel_tla = st.selectbox(
-        "选择球队",
-        tla_options,
-        format_func=lambda x: f"{x} — {team_names_by_tla.get(x, x)}"
-    )
-
-    players = get_key_players(sel_tla)
-    if players:
-        st.markdown(f"**{team_names_by_tla.get(sel_tla, sel_tla)} 核心球员**")
-        col_hdr1, col_hdr2, col_hdr3, col_hdr4 = st.columns([3, 2, 2, 4])
-        col_hdr1.markdown("**球员**")
-        col_hdr2.markdown("**位置**")
-        col_hdr3.markdown("**影响力 (Elo)**")
-        col_hdr4.markdown("**状态**")
-
-        changed = False
-        for p in players:
-            name = p["name"]
-            c1, c2, c3, c4 = st.columns([3, 2, 2, 4])
-            c1.write(name)
-            c2.write(p["position"])
-            c3.write(f"-{p['impact']} pts")
-            current = st.session_state.player_statuses.get(name, p["status"])
-            new_status = c4.radio(
-                f"_{name}",
-                ["FIT", "DOUBTFUL", "OUT"],
-                index=["FIT", "DOUBTFUL", "OUT"].index(current),
-                horizontal=True,
-                label_visibility="collapsed",
-            )
-            if new_status != st.session_state.player_statuses.get(name):
-                st.session_state.player_statuses[name] = new_status
-                changed = True
-
-        if changed:
-            st.cache_data.clear()
-            st.rerun()
-
-        # Show team Elo impact
-        base_elo = elo.get_rating(
-            next((t["id"] for t in teams if t.get("tla") == sel_tla), 0)
-        )
-        adj_elo = compute_player_adjusted_elo(base_elo, sel_tla, st.session_state.player_statuses)
-        st.markdown("---")
-        colx, coly = st.columns(2)
-        colx.metric("基础 Elo", f"{base_elo:.0f}")
-        coly.metric("球员调整后 Elo", f"{adj_elo:.0f}", delta=f"{adj_elo - base_elo:.0f}")
+# ════════════════════════ 复盘 ════════════════════════
+with tab_review:
+    st.caption("已结束比赛 vs 赛前预测的对比，用真实结果校验模型准确度。")
+    reviews = plog.reconcile(fixed, team_map)
+    s = plog.summary(reviews)
+    if not s:
+        st.info("还没有可复盘的比赛。比赛结束后会自动出现胜负/比分命中率。")
     else:
-        st.info(f"{team_names_by_tla.get(sel_tla, sel_tla)} 暂无核心球员数据（可在 data/players.py 中添加）")
-
-    # Quick overview of all OUT players
-    out_players = [
-        (name, status)
-        for name, status in st.session_state.player_statuses.items()
-        if status in ("OUT", "DOUBTFUL")
-    ]
-    if out_players:
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("胜负命中率", f"{s['outcome_acc']*100:.0f}%", help=f"共 {s['n']} 场")
+        c2.metric("比分命中率", f"{s['score_acc']*100:.0f}%")
+        c3.metric("Brier", f"{s['avg_brier']:.3f}", help="越低越好")
+        c4.metric("LogLoss", f"{s['avg_logloss']:.3f}", help="越低越好")
         st.markdown("---")
-        st.subheader("🚨 当前伤病/停赛名单")
-        for name, status in sorted(out_players):
-            icon = "❌" if status == "OUT" else "⚠️"
-            st.write(f"{icon} **{name}** — {status}")
-
-# ═══════════════════════════════════════════════════════════════════
-# TAB 6: Full Rankings
-# ═══════════════════════════════════════════════════════════════════
-with tab6:
-    st.subheader("🔢 全部 48 队完整排名")
-
-    display_df = df[[
-        "Team", "TLA", "Elo", "冠军概率%", "进决赛%",
-        "进四强%", "进八强%", "进16强%", "出线%", "赔率冠军概率%"
-    ]].copy()
-
-    def colour_pct(val):
-        if isinstance(val, (int, float)) and val > 0:
-            alpha = min(val / 40, 0.85)
-            return f"background-color: rgba(0,140,0,{alpha:.2f}); color: white"
-        return ""
-
-    pct_cols = ["冠军概率%", "进决赛%", "进四强%", "进八强%", "进16强%", "出线%"]
-    styled = (
-        display_df.style
-        .applymap(colour_pct, subset=pct_cols)
-        .format({c: "{:.1f}%" for c in pct_cols + ["赔率冠军概率%"]},
-                na_rep="—")
-        .format({"Elo": "{:.0f}"})
-    )
-    st.dataframe(styled, use_container_width=True, height=1400)
+        for r in reviews:
+            hit = "✅" if r["outcome_hit"] else "❌"
+            sc = "🎯" if r["score_hit"] else ""
+            probs_str = f"{r['p_home']*100:.0f}/{r['p_draw']*100:.0f}/{r['p_away']*100:.0f}"
+            st.markdown(
+                f"{hit} **{r['home_name']} {r['actual_home']}–{r['actual_away']} {r['away_name']}** {sc}　"
+                f"<small>预测比分 {r['pred_home']}:{r['pred_away']}　胜平负 {probs_str}%</small>",
+                unsafe_allow_html=True)
