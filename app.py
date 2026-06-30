@@ -17,6 +17,7 @@ from data.fetcher import (
 )
 from data.players import compute_player_adjusted_elo, KEY_PLAYERS
 from data import predictions as plog
+from data.names import zh_name
 from models.elo import EloSystem
 from models.simulator import TournamentSimulator
 from models.predictor import predict_match
@@ -43,9 +44,32 @@ st.set_page_config(page_title="⚽ 2026世界杯预测", page_icon="⚽",
 # ── 移动端紧凑样式 ──────────────────────────────────────────────
 st.markdown("""
 <style>
-.block-container {padding-top: 1.2rem; padding-bottom: 2rem; max-width: 720px;}
-[data-testid="stMetricValue"] {font-size: 1.4rem;}
+/* 移动端（iOS/Android）适配 */
+.block-container {padding-top: 1.0rem; padding-bottom: 2.5rem; max-width: 720px;}
+@media (max-width: 640px) {
+  .block-container {padding-left: 0.6rem !important; padding-right: 0.6rem !important; max-width: 100%;}
+  [data-testid="stMetricValue"] {font-size: 1.25rem;}
+  [data-testid="stMetricContainer"] {gap: 0.2rem;}
+  h1 {font-size: 1.3rem !important;}
+  h3 {font-size: 1.05rem !important;}
+  /* 标签页在窄屏上紧凑显示 */
+  button[kind="secondary"] {padding: 0.3rem 0.5rem !important; font-size: 0.85rem;}
+  /* 表格/数据框横向可滚 */
+  [data-testid="stDataFrame"] {overflow-x: auto;}
+  /* 下拉框/选择框在窄屏撑满 */
+  [data-testid="stSelectbox"] {width: 100%;}
+  /* 图表不溢出 */
+  [data-testid="stVerticalBlock"] > div {width: 100%;}
+}
 h1 {font-size: 1.5rem !important;}
+[data-testid="stMetricValue"] {font-size: 1.4rem;}
+/* 防止 iOS Safari 下方的 home indicator 遮挡内容 */
+html, body {overscroll-behavior: none;}
+footer {display: none !important;}
+/* viewport meta 由 Streamlit 注入；额外允许 pinch-zoom */
+@supports (-webkit-touch-callout: none) {
+  .main {padding-bottom: env(safe-area-inset-bottom);}
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -151,7 +175,7 @@ with tab_champ:
     for tid, t in team_map.items():
         p = probs.get(tid, {})
         champ_rows.append({
-            "球队": t.get("name", "?"),
+            "球队": zh_name(t),
             "夺冠%": round(p.get("win", 0) * 100, 1),
             "出线%": round(p.get("group_qualify", 0) * 100, 0),
         })
@@ -187,22 +211,25 @@ with tab_match:
         labels = []
         for m in upcoming[:60]:
             d = m["utcDate"][:10]
-            labels.append(f"{d} | {m['homeTeam'].get('name','?')} vs {m['awayTeam'].get('name','?')}")
+            labels.append(f"{d} | {zh_name(m['homeTeam'])} vs {zh_name(m['awayTeam'])}")
         sel = st.selectbox("选择比赛", labels)
         m = upcoming[labels.index(sel)]
 
         ht, at = m["homeTeam"], m["awayTeam"]
-        h_name, a_name = ht.get("name", "?"), at.get("name", "?")
-        odds_pr = odds_map.get(frozenset([h_name, a_name]))
+        # 显示用中文名；赔率匹配仍用 API 英文名（内部不变）
+        h_name, a_name = zh_name(ht), zh_name(at)
+        h_name_en, a_name_en = ht.get("name", "?"), at.get("name", "?")
+        odds_pr = odds_map.get(frozenset([h_name_en, a_name_en]))
         res = predict_match(
-            home_id=ht["id"], away_id=at["id"], home_name=h_name, away_name=a_name,
+            home_id=ht["id"], away_id=at["id"], home_name=h_name_en, away_name=a_name_en,
             home_tla=ht.get("tla", ""), away_tla=at.get("tla", ""),
             elo=elo, player_statuses=player_statuses, odds_probs=odds_pr,
             home_adv_elo=_host_adv(ht.get("tla", "")),
             odds_weight=market_weight,          # 用自动调参后的市场权重
         )
 
-        reading = metaphysics_reading(h_name, a_name, m.get("venue", ""), m["utcDate"][:10])
+        # 玄学用中文名算（确定性哈希，结果与队绑定而非语言绑定）
+        reading = metaphysics_reading(h_name_en, a_name_en, m.get("venue", ""), m["utcDate"][:10])
 
         # 纯模型（不加玄学）
         base_p = (res["p_home"], res["p_draw"], res["p_away"])
@@ -262,11 +289,15 @@ with tab_review:
         c3.metric("Brier", f"{s['avg_brier']:.3f}", help="越低越好")
         c4.metric("LogLoss", f"{s['avg_logloss']:.3f}", help="越低越好")
         st.markdown("---")
+        # 英文名→中文名翻译表（兼容历史日志里以英文名存档的记录）
+        en_to_zh = {t.get("name", ""): zh_name(t) for t in team_map.values()}
+        def _zh(n):
+            return en_to_zh.get(n, n)
         for r in reviews:
             hit = "✅" if r["outcome_hit"] else "❌"
             sc = "🎯" if r["score_hit"] else ""
             probs_str = f"{r['p_home']*100:.0f}/{r['p_draw']*100:.0f}/{r['p_away']*100:.0f}"
             st.markdown(
-                f"{hit} **{r['home_name']} {r['actual_home']}–{r['actual_away']} {r['away_name']}** {sc}　"
+                f"{hit} **{_zh(r['home_name'])} {r['actual_home']}–{r['actual_away']} {_zh(r['away_name'])}** {sc}　"
                 f"<small>预测比分 {r['pred_home']}:{r['pred_away']}　胜平负 {probs_str}%</small>",
                 unsafe_allow_html=True)
