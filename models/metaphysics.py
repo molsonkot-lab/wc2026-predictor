@@ -11,6 +11,11 @@
 import hashlib
 from typing import Tuple, Dict
 
+# 玄学偏置上限系数：满强度(strength=1)+满bias(±1)时对胜率/xG 的最大相对偏移。
+# 原值 0.15 过小（典型 bias≈0.5 时只有 ~7.5%，肉眼几乎看不出），上调到 0.40
+# 让玄学在用户主动调大滑块时产生可见效果（仍是纯娱乐）。
+TILT_MAX = 0.40
+
 WU_XING = ["金", "木", "水", "火", "土"]
 # 五行相克：key 克 value（被克方处于劣势）
 KE = {"金": "木", "木": "土", "土": "水", "水": "火", "火": "金"}
@@ -114,7 +119,7 @@ def apply_tilt(p_home: float, p_draw: float, p_away: float,
     """
     if strength <= 0 or bias == 0:
         return p_home, p_draw, p_away
-    shift = bias * strength * 0.15   # 最多 ±15% 的相对偏移（满强度+满bias）
+    shift = bias * strength * TILT_MAX   # 最多 ±40% 的相对偏移（满强度+满bias）
     ph = max(1e-4, p_home * (1 + shift))
     pa = max(1e-4, p_away * (1 - shift))
     pd = max(1e-4, p_draw)
@@ -129,5 +134,5 @@ def tilt_xg(lam: float, mu: float, bias: float, strength: float) -> Tuple[float,
     """
     if strength <= 0 or bias == 0:
         return lam, mu
-    f = bias * strength * 0.15
+    f = bias * strength * TILT_MAX
     return max(0.1, lam * (1 + f)), max(0.1, mu * (1 - f))

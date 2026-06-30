@@ -30,8 +30,12 @@ HOME_ADVANTAGE_ELO = 65    # full home advantage
 WC_HOST_ADVANTAGE = 45     # reduced at World Cup (neutral stadiums mostly)
 
 # International football goal averages
-AVG_GOALS_PER_TEAM = 1.25  # goals per team per match
+AVG_GOALS_PER_TEAM = 1.40  # goals per team per match (raised 1.25→1.40 so
+                           # expected scores aren't perpetually rounded to 1)
 DC_RHO = 0.08              # Dixon-Coles low-score correction
+# How strongly an Elo gap translates into a goal-difference (xG) gap.
+# Raised 0.55→0.70 so clear favourites pull away to 2:0 / 3:0 instead of 1:0.
+ELO_GOAL_EXPONENT = 0.70
 
 # How much to trust bookmaker odds vs Elo (0=pure Elo, 1=pure odds)
 ODDS_BLEND_WEIGHT = 0.35

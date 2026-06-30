@@ -24,6 +24,7 @@ def predict_match(
     odds_probs: Optional[Tuple[float, float, float]] = None,  # from bookmaker
     home_adv_elo: float = 0.0,
     odds_weight: Optional[float] = None,   # market blend weight (None → config default)
+    goal_env: float = 1.0,                 # heat/altitude scoring multiplier (1.0 = neutral)
 ) -> Dict:
     """
     Returns a prediction dict with probabilities, expected score,
@@ -38,7 +39,7 @@ def predict_match(
     adj_elo_h = compute_player_adjusted_elo(base_elo_h, home_tla, player_statuses)
     adj_elo_a = compute_player_adjusted_elo(base_elo_a, away_tla, player_statuses)
 
-    lam, mu = elo_to_lambdas(adj_elo_h, adj_elo_a, home_adv_elo)
+    lam, mu = elo_to_lambdas(adj_elo_h, adj_elo_a, home_adv_elo, goal_env=goal_env)
     p_h, p_d, p_a = match_probabilities(lam, mu)
 
     # Blend with market odds if available

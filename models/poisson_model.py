@@ -6,21 +6,29 @@ import numpy as np
 from scipy.stats import poisson as scipy_poisson
 from typing import Tuple
 import math
-from config import AVG_GOALS_PER_TEAM, DC_RHO, ODDS_BLEND_WEIGHT
+from config import (
+    AVG_GOALS_PER_TEAM, DC_RHO, ODDS_BLEND_WEIGHT, ELO_GOAL_EXPONENT,
+)
 
 MAX_GOALS = 9   # max goals in distribution (>9 is negligible)
 
 
 def elo_to_lambdas(elo_home: float, elo_away: float,
-                   home_adv_elo: float = 0.0) -> Tuple[float, float]:
+                   home_adv_elo: float = 0.0,
+                   goal_env: float = 1.0) -> Tuple[float, float]:
     """
     Convert Elo ratings to Poisson lambdas (expected goals per team).
-    Calibrated: 200-pt Elo gap ≈ 63% win probability; avg 1.25 goals/team.
+    Calibrated: 200-pt Elo gap ≈ 63% win probability.
+
+    goal_env scales the overall scoring baseline for match conditions
+    (heat / altitude); 1.0 = neutral. It multiplies both teams equally,
+    so it shifts the total goals without biasing either side.
     """
     dr = (elo_home - elo_away + home_adv_elo) / 400
-    ratio = 10 ** (dr * 0.55)   # softer than win-prob, empirically calibrated
-    lam = AVG_GOALS_PER_TEAM * math.sqrt(ratio)
-    mu = AVG_GOALS_PER_TEAM / math.sqrt(ratio)
+    ratio = 10 ** (dr * ELO_GOAL_EXPONENT)
+    base = AVG_GOALS_PER_TEAM * goal_env
+    lam = base * math.sqrt(ratio)
+    mu = base / math.sqrt(ratio)
     # Clamp to reasonable range
     lam = max(0.3, min(4.5, lam))
     mu = max(0.3, min(4.5, mu))
@@ -66,10 +74,35 @@ def match_probabilities(lam: float, mu: float,
 
 
 def most_likely_score(lam: float, mu: float) -> Tuple[int, int]:
-    """Return the most probable exact scoreline."""
+    """Return the most probable exact scoreline (the matrix mode / argmax).
+
+    NOTE: For typical football lambdas (~1.0–1.8) the Poisson mode is floor(λ),
+    so this collapses to 1:0 / 1:1 / 0:0 in the vast majority of matches even
+    when one side is a clear favourite. Prefer `expected_score` (continuous,
+    responds to strength) or `top_scorelines` (shows the spread) for display.
+    """
     M = score_matrix(lam, mu)
     idx = int(np.argmax(M))
     return divmod(idx, MAX_GOALS + 1)
+
+
+def expected_score(lam: float, mu: float) -> Tuple[int, int]:
+    """Rounded expected goals — a point estimate that actually tracks team
+    strength (unlike the argmax mode). e.g. xG 1.6–1.0 → 2:1, not 1:0."""
+    return int(round(lam)), int(round(mu))
+
+
+def top_scorelines(lam: float, mu: float, rho: float = DC_RHO,
+                   n: int = 3) -> list:
+    """Return the n most likely exact scorelines as [((h, a), prob), ...].
+
+    Surfacing this (instead of a single modal score) makes the probability
+    spread visible — 1:0 being 'most likely' at only ~12% is the whole point.
+    """
+    M = score_matrix(lam, mu, rho)
+    flat = [(M[i, j], i, j) for i in range(M.shape[0]) for j in range(M.shape[1])]
+    flat.sort(reverse=True)
+    return [((i, j), float(p)) for p, i, j in flat[:n]]
 
 
 def blend_with_odds(p_model: Tuple[float, float, float],
