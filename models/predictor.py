@@ -5,8 +5,8 @@ Combines Elo + Dixon-Coles + odds + player factors.
 from typing import Dict, Tuple, Optional
 from models.elo import EloSystem
 from models.poisson_model import (
-    elo_to_lambdas, match_probabilities, most_likely_score,
-    blend_with_odds, score_matrix
+    elo_to_lambdas, match_probabilities, blend_with_odds,
+    fit_lambdas_to_probs, representative_score,
 )
 from data.players import get_key_players, compute_player_adjusted_elo
 import numpy as np
@@ -25,6 +25,7 @@ def predict_match(
     home_adv_elo: float = 0.0,
     odds_weight: Optional[float] = None,   # market blend weight (None → config default)
     goal_env: float = 1.0,                 # heat/altitude scoring multiplier (1.0 = neutral)
+    avg_goals: Optional[float] = None,     # tuned per-team goal baseline (None → config default)
 ) -> Dict:
     """
     Returns a prediction dict with probabilities, expected score,
@@ -39,14 +40,18 @@ def predict_match(
     adj_elo_h = compute_player_adjusted_elo(base_elo_h, home_tla, player_statuses)
     adj_elo_a = compute_player_adjusted_elo(base_elo_a, away_tla, player_statuses)
 
-    lam, mu = elo_to_lambdas(adj_elo_h, adj_elo_a, home_adv_elo, goal_env=goal_env)
+    lam, mu = elo_to_lambdas(adj_elo_h, adj_elo_a, home_adv_elo,
+                             goal_env=goal_env, base_goals=avg_goals)
     p_h, p_d, p_a = match_probabilities(lam, mu)
 
-    # Blend with market odds if available
-    if odds_probs:
+    # Blend with market odds if available, then refit lambdas to the blended
+    # probabilities so the scoreline reflects the market signal too (keeping
+    # the environment-adjusted total-goals level).
+    if odds_probs and w > 0:
         p_h, p_d, p_a = blend_with_odds((p_h, p_d, p_a), odds_probs, weight=w)
+        lam, mu = fit_lambdas_to_probs(p_h, p_d, p_a, total=lam + mu)
 
-    ml_home, ml_away = most_likely_score(lam, mu)
+    (ml_home, ml_away), _ = representative_score(lam, mu, (p_h, p_d, p_a))
 
     reasoning = _build_reasoning(
         home_name=home_name, away_name=away_name,

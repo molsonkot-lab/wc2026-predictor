@@ -21,23 +21,28 @@ from data.names import zh_name
 from models.elo import EloSystem
 from models.simulator import TournamentSimulator
 from models.predictor import predict_match
-from models.poisson_model import expected_score, top_scorelines
+from models.poisson_model import top_scorelines, representative_score
 from models.calibration import calibrate_elo_to_market
 from models.metaphysics import metaphysics_reading, apply_tilt, tilt_xg
 from models.conditions import venue_goal_factor, city_options
 
 
-def _tuned_market_weight(default=0.7):
-    """Read the auto-tuned market_weight (written nightly by scripts/auto_tune.py)."""
+def _tuned_params():
+    """Read auto-tuned params (written nightly by scripts/auto_tune.py).
+    Returns {"market_weight": float, "avg_goals_per_team": float|None}."""
+    out = {"market_weight": 0.7, "avg_goals_per_team": None}
     try:
         import json as _json
         from pathlib import Path as _Path
         p = _Path(__file__).parent / "tuned_params.json"
         if p.exists():
-            return float(_json.loads(p.read_text()).get("market_weight", default))
+            d = _json.loads(p.read_text())
+            out["market_weight"] = float(d.get("market_weight", out["market_weight"]))
+            if d.get("avg_goals_per_team"):
+                out["avg_goals_per_team"] = float(d["avg_goals_per_team"])
     except Exception:
         pass
-    return default
+    return out
 
 st.set_page_config(page_title="⚽ 2026世界杯预测", page_icon="⚽",
                    layout="centered", initial_sidebar_state="collapsed")
@@ -107,14 +112,16 @@ def run_sims(_sim, n, fixed_json, override_json):
 st.sidebar.title("⚙️ 设置")
 n_sims = st.sidebar.select_slider("模拟次数", options=[5_000, 10_000, 20_000],
                                   value=10_000, help="越高越精确，越慢")
-_mw_default = _tuned_market_weight()
+_tuned = _tuned_params()
+_mw_default = _tuned["market_weight"]
 market_weight = st.sidebar.slider(
     "市场锚定强度", 0.0, 1.0, _mw_default, 0.05,
     help="0=纯模型；1=完全贴合博彩赔率。默认值由每晚自动调参(GitHub Actions)按真实战绩矫正。")
 st.sidebar.caption(f"🤖 当前自动调参建议值：{_mw_default:.2f}")
 mystic_strength = st.sidebar.slider(
-    "🔮 玄学影响力", 0.0, 1.0, 0.0, 0.1,
-    help="默认0=不影响真实预测。调大才让五行/风水/大运对概率施加偏置（纯娱乐）。")
+    "🔮 玄学影响力", 0.0, 1.0, 0.5, 0.1,
+    help="五行/风水/日干支大运对概率的偏置强度（纯娱乐）。默认0.5；"
+         "调到0则完全不影响统计预测。复盘中的玄学比分固定按0.5口径记录。")
 if st.sidebar.button("🔄 刷新实时数据", use_container_width=True):
     fetch_wc_matches(force_refresh=True)
     fetch_match_odds(force_refresh=True)
@@ -236,23 +243,32 @@ with tab_match:
             home_adv_elo=_host_adv(ht.get("tla", "")),
             odds_weight=market_weight,          # 用自动调参后的市场权重
             goal_env=goal_env,                  # 高温/海拔进球修正
+            avg_goals=_tuned["avg_goals_per_team"],  # 复盘回测出的真实进球水平
         )
 
-        # 玄学用中文名算（确定性哈希，结果与队绑定而非语言绑定）
-        reading = metaphysics_reading(h_name_en, a_name_en, m.get("venue", ""), m["utcDate"][:10])
+        # 玄学批语：方位五行 + 真实日干支 + 承办城市风水（选了城市才计入场地）
+        reading = metaphysics_reading(h_name_en, a_name_en,
+                                      _city_label if _city_key else "",
+                                      m["utcDate"][:10])
 
-        # 纯模型（不加玄学）：xG 是连续值，会随实力变化，作为比分展示的依据
+        # 纯模型（不加玄学）：xG 已含市场锚定，比分与胜平负结论一致
         base_p = (res["p_home"], res["p_draw"], res["p_away"])
         base_xg = (res["xg_home"], res["xg_away"])
+        base_score = (res["predicted_home"], res["predicted_away"])
         # 加玄学（按当前玄学影响力强度，影响胜率 + 预期进球/比分）
         myst_p = apply_tilt(*base_p, reading["bias"], mystic_strength)
         myst_xg = tilt_xg(res["xg_home"], res["xg_away"],
                           reading["bias"], mystic_strength)
 
-        # 记录"不加玄学"的纯模型预测供复盘（玄学不应污染质检）。
-        # 比分用四舍五入期望比分（随实力变化），而非恒为 1:0 的众数。
-        base_score = expected_score(*base_xg)
-        plog.log_prediction(m["id"], h_name, a_name, *base_p, *base_score, m["utcDate"])
+        # 复盘存档：模型比分 + 玄学比分双轨，任一命中即算比分命中。
+        # 玄学口径固定为强度0.5、不含场地风水，与滑块/城市选择无关，保证指标稳定。
+        _log_reading = metaphysics_reading(h_name_en, a_name_en, "", m["utcDate"][:10])
+        _log_myst_p = apply_tilt(*base_p, _log_reading["bias"], plog.MYSTIC_REVIEW_STRENGTH)
+        _log_myst_xg = tilt_xg(*base_xg, _log_reading["bias"], plog.MYSTIC_REVIEW_STRENGTH)
+        (_myst_h, _myst_a), _ = representative_score(*_log_myst_xg, _log_myst_p)
+        plog.log_prediction(m["id"], h_name, a_name, *base_p, *base_score,
+                            m["utcDate"], myst_home=_myst_h, myst_away=_myst_a,
+                            xg_home=base_xg[0], xg_away=base_xg[1])
 
         st.markdown(f"### {h_name} vs {a_name}")
         compare = st.toggle("🔮 对比：加玄学 vs 不加玄学", value=False,
@@ -265,10 +281,10 @@ with tab_match:
             c1.metric(f"{h_name} 胜", f"{p[0]*100:.0f}%")
             c2.metric("平局", f"{p[1]*100:.0f}%")
             c3.metric(f"{a_name} 胜", f"{p[2]*100:.0f}%")
-            eh, ea = expected_score(lam, mu)
-            st.metric("🎯 预期比分", f"{eh} : {ea}",
-                      help=f"按预期进球 xG {lam:.2f}–{mu:.2f} 四舍五入；"
-                           "比单一'最可能比分'更能反映实力差")
+            (eh, ea), sp = representative_score(lam, mu, p)
+            st.metric("🎯 预测比分", f"{eh} : {ea}",
+                      help=f"与胜平负结论一致的最可能比分（该比分概率 {sp*100:.0f}%）；"
+                           f"xG {lam:.2f}–{mu:.2f}，已含市场赔率信号")
             tops = top_scorelines(lam, mu, n=3)
             tops_str = "　".join(f"**{i}:{j}** {pr*100:.0f}%" for (i, j), pr in tops)
             st.caption(f"最可能波胆：{tops_str}")
@@ -294,6 +310,8 @@ with tab_match:
                        + (f"　|　🌡️ {env_note}" if goal_env != 1.0 else ""))
             with st.expander("🔮 玄学一览" + ("（已计入上方）" if mystic_strength > 0 else "（未计入）")):
                 st.write(reading["verdict"])
+                for _line in reading.get("details", []):
+                    st.caption(_line)
 
 # ════════════════════════ 复盘 ════════════════════════
 with tab_review:
@@ -305,9 +323,14 @@ with tab_review:
     else:
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("胜负命中率", f"{s['outcome_acc']*100:.0f}%", help=f"共 {s['n']} 场")
-        c2.metric("比分命中率", f"{s['score_acc']*100:.0f}%")
+        c2.metric("比分命中率", f"{s['score_acc']*100:.0f}%",
+                  help="双轨口径：模型比分或玄学比分任一命中即算命中")
         c3.metric("Brier", f"{s['avg_brier']:.3f}", help="越低越好")
         c4.metric("LogLoss", f"{s['avg_logloss']:.3f}", help="越低越好")
+        st.caption(
+            f"比分分轨：模型 {s['score_acc_base']*100:.0f}% / 玄学 {s['score_acc_myst']*100:.0f}%　·　"
+            f"总进球偏差 {s['goal_bias']:+.2f}/场（正=预测偏多，喂给每晚自动调参矫正进球水平）　·　"
+            f"进球平均误差 {s['goal_mae']:.2f}")
         st.markdown("---")
         # 英文名→中文名翻译表（兼容历史日志里以英文名存档的记录）
         en_to_zh = {t.get("name", ""): zh_name(t) for t in team_map.values()}
@@ -316,8 +339,11 @@ with tab_review:
         for r in reviews:
             hit = "✅" if r["outcome_hit"] else "❌"
             sc = "🎯" if r["score_hit"] else ""
+            b_mark = "🎯" if r["score_hit_base"] else ""
+            m_mark = "🎯" if r["score_hit_myst"] else ""
             probs_str = f"{r['p_home']*100:.0f}/{r['p_draw']*100:.0f}/{r['p_away']*100:.0f}"
             st.markdown(
                 f"{hit} **{_zh(r['home_name'])} {r['actual_home']}–{r['actual_away']} {_zh(r['away_name'])}** {sc}　"
-                f"<small>预测比分 {r['pred_home']}:{r['pred_away']}　胜平负 {probs_str}%</small>",
+                f"<small>模型 {r['pred_home']}:{r['pred_away']}{b_mark}　"
+                f"玄学 {r['myst_home']}:{r['myst_away']}{m_mark}　胜平负 {probs_str}%</small>",
                 unsafe_allow_html=True)

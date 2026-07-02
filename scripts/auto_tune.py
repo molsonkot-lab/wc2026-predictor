@@ -120,10 +120,23 @@ def main():
         params["note"] = f"samples<{MIN_SAMPLES}, keeping default to avoid overfit"
         params["updated_at"] = datetime.now(timezone.utc).isoformat()
 
+    # ── 3. Tune the per-team goal baseline from real finished matches ─────
+    # Fixes the "predicted score is always 2:1-ish" drift: if the tournament
+    # runs hotter/colder than AVG_GOALS_PER_TEAM assumes, shrink toward the
+    # observed average (Bayesian shrinkage, prior weight = 8 matches at 1.40).
+    totals = [hg + ag for hg, ag in fixed.values()]
+    if totals:
+        prior_goals, prior_matches = 1.40, 8
+        avg = ((prior_goals * prior_matches * 2 + sum(totals))
+               / ((prior_matches + len(totals)) * 2))
+        params["avg_goals_per_team"] = round(avg, 3)
+        params["goal_samples"] = len(totals)
+
     LOG_PATH.write_text(json.dumps(log, ensure_ascii=False, indent=2), encoding="utf-8")
     PARAMS_PATH.write_text(json.dumps(params, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"snapshots added: {new_snaps} | tuning samples: {len(samples)} "
-          f"| market_weight -> {params['market_weight']}")
+          f"| market_weight -> {params['market_weight']} "
+          f"| avg_goals_per_team -> {params.get('avg_goals_per_team', 'n/a')}")
 
 
 if __name__ == "__main__":

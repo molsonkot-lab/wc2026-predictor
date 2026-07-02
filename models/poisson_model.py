@@ -15,7 +15,8 @@ MAX_GOALS = 9   # max goals in distribution (>9 is negligible)
 
 def elo_to_lambdas(elo_home: float, elo_away: float,
                    home_adv_elo: float = 0.0,
-                   goal_env: float = 1.0) -> Tuple[float, float]:
+                   goal_env: float = 1.0,
+                   base_goals: float = None) -> Tuple[float, float]:
     """
     Convert Elo ratings to Poisson lambdas (expected goals per team).
     Calibrated: 200-pt Elo gap ≈ 63% win probability.
@@ -23,10 +24,12 @@ def elo_to_lambdas(elo_home: float, elo_away: float,
     goal_env scales the overall scoring baseline for match conditions
     (heat / altitude); 1.0 = neutral. It multiplies both teams equally,
     so it shifts the total goals without biasing either side.
+    base_goals overrides AVG_GOALS_PER_TEAM (fed by the nightly auto-tune,
+    which re-estimates the real per-team goal average from finished matches).
     """
     dr = (elo_home - elo_away + home_adv_elo) / 400
     ratio = 10 ** (dr * ELO_GOAL_EXPONENT)
-    base = AVG_GOALS_PER_TEAM * goal_env
+    base = (AVG_GOALS_PER_TEAM if base_goals is None else base_goals) * goal_env
     lam = base * math.sqrt(ratio)
     mu = base / math.sqrt(ratio)
     # Clamp to reasonable range
@@ -103,6 +106,61 @@ def top_scorelines(lam: float, mu: float, rho: float = DC_RHO,
     flat = [(M[i, j], i, j) for i in range(M.shape[0]) for j in range(M.shape[1])]
     flat.sort(reverse=True)
     return [((i, j), float(p)) for p, i, j in flat[:n]]
+
+
+def fit_lambdas_to_probs(p_home: float, p_draw: float, p_away: float,
+                         total: float, rho: float = DC_RHO) -> Tuple[float, float]:
+    """
+    Invert the Dixon-Coles model: find (lam, mu) whose W/D/L probabilities best
+    match a target probability vector, keeping the total-goals level fixed.
+
+    Why: match probabilities get blended with bookmaker odds, but the raw Elo
+    lambdas used for the scoreline display don't — so the score could contradict
+    the (market-informed) W/D/L numbers. Fitting lambdas back to the blended
+    probs makes the predicted score absorb the market signal too.
+    """
+    total = max(0.6, min(9.0, total))
+    best, best_err = (total / 2, total / 2), float("inf")
+    for i in range(33):
+        w = 0.12 + (0.88 - 0.12) * i / 32
+        lam = max(0.3, min(4.5, total * w))
+        mu = max(0.3, min(4.5, total - lam))
+        ph, pd, pa = match_probabilities(lam, mu, rho)
+        err = (ph - p_home) ** 2 + (pd - p_draw) ** 2 + (pa - p_away) ** 2
+        if err < best_err:
+            best_err, best = err, (lam, mu)
+    return best
+
+
+def representative_score(lam: float, mu: float,
+                         probs: Tuple[float, float, float] = None,
+                         rho: float = DC_RHO) -> Tuple[Tuple[int, int], float]:
+    """
+    Most likely exact scoreline CONSISTENT with the predicted outcome.
+
+    Rounded xG collapses to 2:1 / 1:1 / 3:1 for nearly every match; the raw
+    matrix argmax collapses to 1:0 / 1:1. This picks argmax within the region
+    of the highest-probability outcome (home win / draw / away win), so the
+    scoreline never contradicts the headline W/D/L call and still varies with
+    the goal distribution. Returns ((home, away), p_of_that_scoreline).
+    """
+    M = score_matrix(lam, mu, rho)
+    if probs is None:
+        probs = match_probabilities(lam, mu, rho)
+    outcome = int(np.argmax(probs))          # 0=home win, 1=draw, 2=away win
+    n = M.shape[0]
+    mask = np.zeros_like(M, dtype=bool)
+    idx = np.arange(n)
+    if outcome == 0:
+        mask[np.tril_indices(n, -1)] = True   # home_goals > away_goals
+    elif outcome == 1:
+        mask[idx, idx] = True
+    else:
+        mask[np.triu_indices(n, 1)] = True
+    Mm = np.where(mask, M, -1.0)
+    flat = int(np.argmax(Mm))
+    h, a = divmod(flat, n)
+    return (h, a), float(M[h, a])
 
 
 def blend_with_odds(p_model: Tuple[float, float, float],
