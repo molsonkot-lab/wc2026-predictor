@@ -54,14 +54,16 @@ def _dc_tau(x: int, y: int, lam: float, mu: float, rho: float) -> float:
 def score_matrix(lam: float, mu: float, rho: float = DC_RHO) -> np.ndarray:
     """
     P[home_goals, away_goals] using Dixon-Coles bivariate Poisson.
-    Shape: (MAX_GOALS+1, MAX_GOALS+1)
+    Shape: (MAX_GOALS+1, MAX_GOALS+1). Vectorised (outer product of the two
+    marginal pmfs + tau correction on the four low-score cells) so the 2-D
+    market inversion in fit_lambdas_to_probs stays fast.
     """
-    n = MAX_GOALS + 1
-    M = np.zeros((n, n))
-    for x in range(n):
-        for y in range(n):
-            tau = _dc_tau(x, y, lam, mu, rho)
-            M[x, y] = tau * scipy_poisson.pmf(x, lam) * scipy_poisson.pmf(y, mu)
+    ks = np.arange(MAX_GOALS + 1)
+    M = np.outer(scipy_poisson.pmf(ks, lam), scipy_poisson.pmf(ks, mu))
+    M[0, 0] *= 1 - lam * mu * rho
+    M[0, 1] *= 1 + lam * rho
+    M[1, 0] *= 1 + mu * rho
+    M[1, 1] *= 1 - rho
     M /= M.sum()  # renormalise after tau correction
     return M
 
@@ -112,37 +114,59 @@ def fit_lambdas_to_probs(p_home: float, p_draw: float, p_away: float,
                          total: float, rho: float = DC_RHO) -> Tuple[float, float]:
     """
     Invert the Dixon-Coles model: find (lam, mu) whose W/D/L probabilities best
-    match a target probability vector, keeping the total-goals level fixed.
+    match a target probability vector — the market-implied xG.
 
-    Why: match probabilities get blended with bookmaker odds, but the raw Elo
-    lambdas used for the scoreline display don't — so the score could contradict
-    the (market-informed) W/D/L numbers. Fitting lambdas back to the blended
-    probs makes the predicted score absorb the market signal too.
+    2-D search: the home/away SPLIT is pinned by the win-probability gap, and
+    the TOTAL goals level is pinned by the draw probability (a low market draw
+    prob implies a high-scoring game and vice versa — the standard way books
+    back out xG from 1X2 prices). The Elo/environment total acts as a soft
+    prior via a small regulariser, so heat/altitude adjustments still matter.
+
+    Why: match probabilities get blended with bookmaker odds, but raw Elo
+    lambdas would let the scoreline contradict the (market-informed) W/D/L
+    numbers — and a ratio-only fit at fixed total squeezes the underdog's xG
+    toward 0, which is what made every scoreline look like 2:0 / 3:0.
     """
-    total = max(0.6, min(9.0, total))
-    best, best_err = (total / 2, total / 2), float("inf")
-    for i in range(33):
-        w = 0.12 + (0.88 - 0.12) * i / 32
-        lam = max(0.3, min(4.5, total * w))
-        mu = max(0.3, min(4.5, total - lam))
-        ph, pd, pa = match_probabilities(lam, mu, rho)
-        err = (ph - p_home) ** 2 + (pd - p_draw) ** 2 + (pa - p_away) ** 2
-        if err < best_err:
-            best_err, best = err, (lam, mu)
+    total0 = max(1.2, min(5.5, total))
+    best, best_err = (total0 / 2, total0 / 2), float("inf")
+    # ±25% 总进球窗口 + 较强先验：1X2 赔率对总进球的信息量有限（主要在平局
+    # 概率里），放太开会把败方 xG 压到 0.x，比分退化成 N:0。
+    for f in (0.85, 0.925, 1.0, 1.075, 1.15, 1.25):
+        t = total0 * f
+        reg = 0.02 * (f - 1.0) ** 2           # soft prior toward Elo/env total
+        for i in range(25):
+            w = 0.12 + (0.88 - 0.12) * i / 24
+            lam = max(0.3, min(4.5, t * w))
+            mu = max(0.3, min(4.5, t - lam))
+            ph, pd, pa = match_probabilities(lam, mu, rho)
+            err = ((ph - p_home) ** 2 + (pd - p_draw) ** 2
+                   + (pa - p_away) ** 2 + reg)
+            if err < best_err:
+                best_err, best = err, (lam, mu)
     return best
+
+
+# 比分点估计里 xG 锚定的强度（高斯 σ，单位：球）。σ 越小越贴近 xG，
+# 越大越接近纯众数。1.0 在真实世界杯比分分布上是合理折中。
+SCORE_TETHER_SIGMA = 1.0
 
 
 def representative_score(lam: float, mu: float,
                          probs: Tuple[float, float, float] = None,
                          rho: float = DC_RHO) -> Tuple[Tuple[int, int], float]:
     """
-    Most likely exact scoreline CONSISTENT with the predicted outcome.
+    Scoreline point estimate: MAP with a Gaussian tether to the xG vector,
+    constrained to be CONSISTENT with the predicted W/D/L outcome.
 
-    Rounded xG collapses to 2:1 / 1:1 / 3:1 for nearly every match; the raw
-    matrix argmax collapses to 1:0 / 1:1. This picks argmax within the region
-    of the highest-probability outcome (home win / draw / away win), so the
-    scoreline never contradicts the headline W/D/L call and still varies with
-    the goal distribution. Returns ((home, away), p_of_that_scoreline).
+        argmax over outcome region of  log P(h,a) − (‖(h,a)−(λ,μ)‖²)/(2σ²)
+
+    Each pure strategy fails alone: rounded xG collapses to 2:1/1:1 for every
+    match; the raw matrix argmax collapses to 1:0/1:1; the outcome-constrained
+    argmax zeroes the loser's goals (1:0/2:0/3:0) because the Poisson mode of
+    μ<1 is 0. The tether keeps the pick both high-probability AND faithful to
+    the continuous strength gap, so an xG of 2.1–1.0 reads 2:1, not 2:0, while
+    a genuine thrashing (2.9–0.5) still reads 3:0.
+    Returns ((home, away), p_of_that_scoreline).
     """
     M = score_matrix(lam, mu, rho)
     if probs is None:
@@ -157,8 +181,12 @@ def representative_score(lam: float, mu: float,
         mask[idx, idx] = True
     else:
         mask[np.triu_indices(n, 1)] = True
-    Mm = np.where(mask, M, -1.0)
-    flat = int(np.argmax(Mm))
+    H, A = np.meshgrid(idx, idx, indexing="ij")
+    dist2 = (H - lam) ** 2 + (A - mu) ** 2
+    util = (np.log(np.maximum(M, 1e-12))
+            - dist2 / (2 * SCORE_TETHER_SIGMA ** 2))
+    util[~mask] = -np.inf
+    flat = int(np.argmax(util))
     h, a = divmod(flat, n)
     return (h, a), float(M[h, a])
 

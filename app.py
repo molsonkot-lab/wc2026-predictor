@@ -18,6 +18,7 @@ from data.fetcher import (
 from data.players import compute_player_adjusted_elo, KEY_PLAYERS
 from data import predictions as plog
 from data.names import zh_name
+from data.venues import venue_city_key
 from models.elo import EloSystem
 from models.simulator import TournamentSimulator
 from models.predictor import predict_match
@@ -223,12 +224,21 @@ with tab_match:
         sel = st.selectbox("选择比赛", labels)
         m = upcoming[labels.index(sel)]
 
-        # 承办城市（API 不提供 venue，手动选 → 接入高温/海拔进球调整）
+        # 承办城市：API 不提供 venue，按 FIFA 官方赛程静态表自动匹配
+        # （data/venues.py，联网核对整理）；匹配不到才需要手动选。
+        _auto_city = venue_city_key(m)
         _city_opts = [("（不指定 · 环境中性）", "")] + city_options()
+        _city_keys = [o[1] for o in _city_opts]
+        _auto_idx = _city_keys.index(_auto_city) if _auto_city in _city_keys else 0
         _city_label = st.selectbox(
             "🌡️ 承办城市（高温/海拔修正）", [o[0] for o in _city_opts],
-            help="2026分布在美/墨/加16城。墨西哥城/瓜达拉哈拉高海拔、迈阿密等酷热露天场会压低进球；封闭空调球场基本中性。")
+            index=_auto_idx, key=f"city_{m['id']}",
+            help="已按 FIFA 官方赛程自动匹配，可手动修改。墨西哥城/瓜达拉哈拉高海拔、"
+                 "迈阿密等酷热露天场会压低进球；封闭空调球场基本中性。")
         _city_key = dict((o[0], o[1]) for o in _city_opts)[_city_label]
+        if _auto_city:
+            st.caption("🛰️ 承办城市已按官方赛程自动匹配" +
+                       ("" if _city_key == _auto_city else "（你已手动修改）"))
         goal_env, env_note = venue_goal_factor(_city_key)
 
         ht, at = m["homeTeam"], m["awayTeam"]
