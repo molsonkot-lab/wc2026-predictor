@@ -147,8 +147,9 @@ def fit_lambdas_to_probs(p_home: float, p_draw: float, p_away: float,
 
 
 # 比分点估计里 xG 锚定的强度（高斯 σ，单位：球）。σ 越小越贴近 xG，
-# 越大越接近纯众数。1.0 在真实世界杯比分分布上是合理折中。
-SCORE_TETHER_SIGMA = 1.0
+# 越大越接近纯众数。1.2 = scripts/backtest.py 在 2018+2022 世界杯 128 场
+# 样本外比分上的命中率最优档（15.6%，vs 四舍五入xG 11.7%、纯众数 12.5%）。
+SCORE_TETHER_SIGMA = 1.2
 
 
 def representative_score(lam: float, mu: float,

@@ -20,3 +20,4 @@ package.json
 # 临时文件
 *.log
 .DS_Store
+intl_results.csv

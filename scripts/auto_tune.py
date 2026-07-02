@@ -26,8 +26,13 @@ from data.fetcher import (fetch_wc_matches, fetch_wc_teams, fetch_match_odds,
                           build_odds_map, get_fixed_results)
 from data.players import compute_player_adjusted_elo, KEY_PLAYERS
 from models.elo import EloSystem
-from models.poisson_model import elo_to_lambdas, match_probabilities
+from models.poisson_model import (elo_to_lambdas, match_probabilities,
+                                  blend_with_odds, fit_lambdas_to_probs,
+                                  representative_score)
+from models.metaphysics import metaphysics_reading, apply_tilt, tilt_xg
 from config import HOST_TEAMS, WC_HOST_ADVANTAGE
+
+MYSTIC_REVIEW_STRENGTH = 0.5   # 与 data/predictions.py 的复盘口径一致
 
 LOG_PATH    = ROOT / "data" / "prediction_log.json"
 PARAMS_PATH = ROOT / "tuned_params.json"
@@ -65,6 +70,7 @@ def main():
     statuses = {p["name"]: p["status"] for v in KEY_PLAYERS.values() for p in v}
 
     log = _load(LOG_PATH, {})
+    cur_w = _load(PARAMS_PATH, {}).get("market_weight", 0.7)
 
     # ── 1. Snapshot upcoming, not-yet-logged matches ──────────────────
     new_snaps = 0
@@ -82,10 +88,23 @@ def main():
         lam, mu = elo_to_lambdas(adj_h, adj_a, host)
         mp = match_probabilities(lam, mu)
         market = odds_map.get(frozenset([h_name, a_name]))
+        # 双轨比分随快照落档（git 持久化）：云端 SQLite 会随部署清空，
+        # 这里才是复盘的真正档案。玄学按复盘固定口径（强度0.5、不含场地）。
+        p = blend_with_odds(mp, market, cur_w) if market else mp
+        if market:
+            lam, mu = fit_lambdas_to_probs(*p, total=lam + mu)
+        (sh, sa), _ = representative_score(lam, mu, p)
+        reading = metaphysics_reading(h_name, a_name, "", m["utcDate"][:10])
+        m_p = apply_tilt(*p, reading["bias"], MYSTIC_REVIEW_STRENGTH)
+        m_xg = tilt_xg(lam, mu, reading["bias"], MYSTIC_REVIEW_STRENGTH)
+        (mh, ma), _ = representative_score(*m_xg, m_p)
         log[mid] = {
             "home": h_name, "away": a_name, "utc": m["utcDate"],
             "model_p": [round(x, 5) for x in mp],
             "market_p": [round(x, 5) for x in market] if market else None,
+            "pred_score": [int(sh), int(sa)],
+            "myst_score": [int(mh), int(ma)],
+            "xg": [round(lam, 3), round(mu, 3)],
         }
         new_snaps += 1
 
@@ -114,6 +133,8 @@ def main():
             "n_samples": len(samples),
             "logloss": round(best_ll, 4),
             "updated_at": datetime.now(timezone.utc).isoformat(),
+            # 保留历史回测拟合结果（scripts/backtest.py 写入，勿覆盖）
+            "backtest": _load(PARAMS_PATH, {}).get("backtest"),
         }
     else:
         params["n_samples"] = len(samples)
@@ -126,7 +147,7 @@ def main():
     # observed average (Bayesian shrinkage, prior weight = 8 matches at 1.40).
     totals = [hg + ag for hg, ag in fixed.values()]
     if totals:
-        prior_goals, prior_matches = 1.40, 8
+        prior_goals, prior_matches = 1.24, 8   # prior = 历史回测拟合值(backtest.py)
         avg = ((prior_goals * prior_matches * 2 + sum(totals))
                / ((prior_matches + len(totals)) * 2))
         params["avg_goals_per_team"] = round(avg, 3)

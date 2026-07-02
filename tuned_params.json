@@ -2,5 +2,22 @@
   "market_weight": 0.7,
   "n_samples": 4,
   "note": "samples<5, keeping default to avoid overfit",
-  "updated_at": "2026-07-02T08:55:06.986305+00:00"
+  "updated_at": "2026-07-02T08:55:06.986305+00:00",
+  "backtest": {
+    "avg_goals_per_team": 1.242,
+    "elo_goal_exponent": 0.7,
+    "dc_rho": 0.0,
+    "train_nll": 2.7948,
+    "n_train": 320,
+    "score_sigma": 1.2,
+    "valid_hit_rates": {
+      "map_sigma_0.6": 0.1172,
+      "map_sigma_0.8": 0.125,
+      "map_sigma_1.0": 0.1328,
+      "map_sigma_1.2": 0.1562,
+      "map_sigma_1.5": 0.1094,
+      "matrix_mode": 0.125,
+      "rounded_xg": 0.1172
+    }
+  }
 }

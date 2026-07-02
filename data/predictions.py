@@ -108,21 +108,70 @@ def _legacy_mystic_score(r) -> tuple:
     return int(round(tl)), int(round(tm))
 
 
-def reconcile(finished: Dict[int, tuple], match_meta: Dict[int, dict] = None) -> List[dict]:
+def _row_from_repo_log(rec: dict, market_weight: float,
+                       avg_goals: float = None) -> Optional[dict]:
+    """
+    从 data/prediction_log.json（auto_tune 每晚快照、随 git 持久化）恢复一条
+    预测记录。线上 Streamlit Cloud 的 SQLite 每次重新部署都会被清空，没有这层
+    兜底，历史命中（如 科特迪瓦1-2挪威、英格兰2-1刚果）就会从复盘里消失。
+
+    新版快照直接带 pred_score/myst_score；老快照只有赛前概率，则做**忠实还原**：
+    当年 app 展示的比分 = 纯 Elo xG 四舍五入（进球基线还是 1.40 的年代）。
+    反推纯 model_p（它就是当时 Elo lambdas 过 DC 模型的输出，反演即恢复原
+    lambdas）再按老规则取整——复盘的是"当时真实给出的预测"，不是新算法的
+    事后重算。概率轨（Brier/胜负）仍用含市场的混合概率，与当时展示一致。
+    """
+    from models.poisson_model import fit_lambdas_to_probs, blend_with_odds
+    from models.metaphysics import metaphysics_reading, tilt_xg
+    mp, kp = rec.get("model_p"), rec.get("market_p")
+    if not mp:
+        return None
+    p = blend_with_odds(tuple(mp), tuple(kp), market_weight) if kp else tuple(mp)
+    if rec.get("pred_score"):
+        ph_, pa_ = rec["pred_score"]
+        mh, ma = rec.get("myst_score", rec["pred_score"])
+        lam, mu = rec.get("xg") or (float(ph_), float(pa_))
+    else:
+        LEGACY_TOTAL = 2.8   # 老配置 AVG_GOALS_PER_TEAM=1.40 × 2
+        lam, mu = fit_lambdas_to_probs(*mp, total=LEGACY_TOTAL)
+        ph_, pa_ = int(round(lam)), int(round(mu))
+        reading = metaphysics_reading(rec.get("home", ""), rec.get("away", ""),
+                                      "", rec.get("utc", "")[:10])
+        tl, tm = tilt_xg(lam, mu, reading["bias"], MYSTIC_REVIEW_STRENGTH)
+        mh, ma = int(round(tl)), int(round(tm))
+    return {
+        "home_name": rec.get("home", "?"), "away_name": rec.get("away", "?"),
+        "p_home": p[0], "p_draw": p[1], "p_away": p[2],
+        "pred_home": int(ph_), "pred_away": int(pa_),
+        "myst_home": int(mh), "myst_away": int(ma),
+        "xg_home": lam, "xg_away": mu,
+        "utc_date": rec.get("utc", ""),
+    }
+
+
+def reconcile(finished: Dict[int, tuple], match_meta: Dict[int, dict] = None,
+              repo_log: Dict[str, dict] = None, market_weight: float = 0.7,
+              avg_goals: float = None) -> List[dict]:
     """
     finished: {match_id: (home_goals, away_goals)} for FINISHED matches.
+    repo_log: data/prediction_log.json 的内容——SQLite 里缺的比赛从这里恢复
+              （云端文件系统随部署重置，git 里的快照才是持久档案）。
     Returns a per-match review list, newest first, each with:
         names, predicted probs/scores (model + mystic), actual score,
         outcome_hit, score_hit (either-track), brier, logloss, goal errors.
     """
     _init()
     match_meta = match_meta or {}
+    repo_log = repo_log or {}
     with _db() as conn:
         logged = {r["match_id"]: r for r in conn.execute("SELECT * FROM predictions")}
 
     reviews = []
     for mid, (hg, ag) in finished.items():
-        r = logged.get(mid)
+        r, source = logged.get(mid), "live"
+        if r is None and str(mid) in repo_log:
+            r, source = _row_from_repo_log(repo_log[str(mid)], market_weight,
+                                           avg_goals), "repo"
         if r is None:
             continue
         actual = _outcome(hg, ag)
@@ -144,6 +193,7 @@ def reconcile(finished: Dict[int, tuple], match_meta: Dict[int, dict] = None) ->
 
         reviews.append({
             "match_id": mid,
+            "source": source,
             "home_name": r["home_name"],
             "away_name": r["away_name"],
             "p_home": r["p_home"], "p_draw": r["p_draw"], "p_away": r["p_away"],

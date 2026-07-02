@@ -326,7 +326,17 @@ with tab_match:
 # ════════════════════════ 复盘 ════════════════════════
 with tab_review:
     st.caption("已结束比赛 vs 赛前预测的对比，用真实结果校验模型准确度。")
-    reviews = plog.reconcile(fixed, team_map)
+    # git 持久化的赛前快照（auto_tune 每晚落档）：云端 SQLite 随部署清空，
+    # 缺失的历史预测从这里恢复，复盘记录不再丢。
+    try:
+        from pathlib import Path as _P
+        _repo_log = json.loads((_P(__file__).parent / "data" /
+                                "prediction_log.json").read_text(encoding="utf-8"))
+    except Exception:
+        _repo_log = {}
+    reviews = plog.reconcile(fixed, team_map, repo_log=_repo_log,
+                             market_weight=market_weight,
+                             avg_goals=_tuned["avg_goals_per_team"])
     s = plog.summary(reviews)
     if not s:
         st.info("还没有可复盘的比赛。比赛结束后会自动出现胜负/比分命中率。")
@@ -340,7 +350,7 @@ with tab_review:
         st.caption(
             f"比分分轨：模型 {s['score_acc_base']*100:.0f}% / 玄学 {s['score_acc_myst']*100:.0f}%　·　"
             f"总进球偏差 {s['goal_bias']:+.2f}/场（正=预测偏多，喂给每晚自动调参矫正进球水平）　·　"
-            f"进球平均误差 {s['goal_mae']:.2f}")
+            f"进球平均误差 {s['goal_mae']:.2f}　·　📜=从 git 存档快照恢复的赛前预测")
         st.markdown("---")
         # 英文名→中文名翻译表（兼容历史日志里以英文名存档的记录）
         en_to_zh = {t.get("name", ""): zh_name(t) for t in team_map.values()}
@@ -352,8 +362,9 @@ with tab_review:
             b_mark = "🎯" if r["score_hit_base"] else ""
             m_mark = "🎯" if r["score_hit_myst"] else ""
             probs_str = f"{r['p_home']*100:.0f}/{r['p_draw']*100:.0f}/{r['p_away']*100:.0f}"
+            src = "　📜" if r.get("source") == "repo" else ""
             st.markdown(
                 f"{hit} **{_zh(r['home_name'])} {r['actual_home']}–{r['actual_away']} {_zh(r['away_name'])}** {sc}　"
                 f"<small>模型 {r['pred_home']}:{r['pred_away']}{b_mark}　"
-                f"玄学 {r['myst_home']}:{r['myst_away']}{m_mark}　胜平负 {probs_str}%</small>",
+                f"玄学 {r['myst_home']}:{r['myst_away']}{m_mark}　胜平负 {probs_str}%{src}</small>",
                 unsafe_allow_html=True)
