@@ -17,6 +17,13 @@ from data.fetcher import (
 )
 from data.players import compute_player_adjusted_elo, KEY_PLAYERS
 from data import predictions as plog
+
+# Streamlit Cloud 热更新只重跑 app.py、不重新 import 模块：push 后如果
+# 进程没重启，plog 还是旧签名会直接 TypeError。检测到旧模块就强制 reload。
+import inspect as _inspect
+if "repo_log" not in _inspect.signature(plog.reconcile).parameters:
+    import importlib as _importlib
+    plog = _importlib.reload(plog)
 from data.names import zh_name
 from data.venues import venue_city_key
 from models.elo import EloSystem
