@@ -42,11 +42,14 @@ class GroupStandings:
 
 class TournamentSimulator:
     def __init__(self, matches: List[Dict], teams: List[Dict], elo: EloSystem,
-                 h2h_map: H2HMap = None):
+                 h2h_map: H2HMap = None, ko_winners: dict = None):
         self.matches = matches
         self.teams = {t["id"]: t for t in teams}
         self.elo = elo
         self.h2h_map: H2HMap = h2h_map or {}
+        # 已完赛淘汰赛的真实晋级方 {frozenset({id_a,id_b}): winner_id}：
+        # 蒙特卡洛不得重演已经发生的历史（含点球结果）。
+        self.ko_winners: dict = ko_winners or {}
         self.groups = self._build_groups()
 
     def _build_groups(self) -> Dict[str, List[int]]:
@@ -78,7 +81,11 @@ class TournamentSimulator:
 
     def _sim_knockout(self, a: int, b: int,
                       elo_overrides: Dict[int, float] = None) -> int:
-        """Simulate knockout match; draw → ET → penalties."""
+        """Simulate knockout match; draw → ET → penalties.
+        真实已完赛的对阵直接采用实际晋级方（含点球结果），不重新模拟。"""
+        actual = self.ko_winners.get(frozenset((a, b)))
+        if actual is not None:
+            return actual
         hg, ag = self._sim_match(a, b, elo_overrides)
         if hg != ag:
             return a if hg > ag else b

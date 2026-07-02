@@ -21,17 +21,20 @@ import data.predictions as _m_plog
 import models.poisson_model as _m_pm
 import models.metaphysics as _m_myst
 import models.predictor as _m_pred
-if (not hasattr(_m_fetch, "build_totals_map")
+import models.simulator as _m_sim
+if (not hasattr(_m_fetch, "get_ko_winners")
         or not hasattr(_m_myst, "mystic_verdict_probs")
+        or "ko_winners" not in _ins.signature(_m_sim.TournamentSimulator.__init__).parameters
         or "totals_pr" not in _ins.signature(_m_pred.predict_match).parameters
         or "repo_log" not in _ins.signature(_m_plog.reconcile).parameters):
-    for _m in (_m_fetch, _m_plog, _m_pm, _m_myst, _m_pred):
+    for _m in (_m_fetch, _m_plog, _m_pm, _m_myst, _m_pred, _m_sim):
         _il.reload(_m)
 
 from config import HOST_TEAMS, WC_HOST_ADVANTAGE
 from data.fetcher import (
     fetch_wc_matches, fetch_wc_teams, fetch_match_odds, fetch_outright_odds,
     build_odds_map, build_outright_map, build_totals_map, get_fixed_results,
+    get_result_details, get_ko_winners,
 )
 from data.players import compute_player_adjusted_elo, KEY_PLAYERS
 from data import predictions as plog
@@ -121,7 +124,8 @@ def calibrate(_sim, _team_map, out_json, base_json, fixed_json, weight):
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def run_sims(_sim, n, fixed_json, override_json):
+def run_sims(_sim, n, fixed_json, override_json, ko_json=""):
+    # ko_json 只参与缓存键：淘汰赛出新结果时强制重算（_sim 不参与哈希）
     fixed    = {int(k): tuple(v) for k, v in json.loads(fixed_json).items()}
     override = {int(k): v        for k, v in json.loads(override_json).items()}
     return _sim.run_simulations(n, fixed, override)
@@ -177,8 +181,10 @@ for tid, t in team_map.items():
     if abs(adj - elo.get_rating(tid)) > 0.5:
         base_overrides[tid] = adj
 
-sim = TournamentSimulator(matches, teams, elo)
+ko_winners = get_ko_winners(matches)   # 已完赛淘汰赛真实晋级方（含点球）
+sim = TournamentSimulator(matches, teams, elo, ko_winners=ko_winners)
 fixed_json = json.dumps({str(k): list(v) for k, v in fixed.items()})
+ko_json = json.dumps(sorted(f"{min(p)}-{max(p)}:{w}" for p, w in ko_winners.items()))
 
 # 市场锚定 → 校准后的 Elo
 with st.spinner("市场赔率校准中..."):
@@ -192,7 +198,8 @@ with st.spinner("市场赔率校准中..."):
 
 with st.spinner(f"运行 {n_sims:,} 次赛程模拟..."):
     probs = run_sims(sim, n_sims, fixed_json,
-                     json.dumps({str(k): v for k, v in overrides.items()}))
+                     json.dumps({str(k): v for k, v in overrides.items()}),
+                     ko_json)
 
 st.title("⚽ 2026 世界杯预测")
 
@@ -347,7 +354,9 @@ with tab_match:
 
 # ════════════════════════ 复盘 ════════════════════════
 with tab_review:
-    st.caption("已结束比赛 vs 赛前预测的对比，用真实结果校验模型准确度。")
+    st.caption("已结束比赛 vs 赛前预测的对比，用真实结果校验模型准确度。"
+               "胜平负/比分均按**常规90分钟**口径（与1X2盘口一致），加时/点球另行标注。")
+    _details = get_result_details(matches)
     # git 持久化的赛前快照（auto_tune 每晚落档）：云端 SQLite 随部署清空，
     # 缺失的历史预测从这里恢复，复盘记录不再丢。
     try:
@@ -385,8 +394,15 @@ with tab_review:
             m_mark = "🎯" if r["score_hit_myst"] else ""
             probs_str = f"{r['p_home']*100:.0f}/{r['p_draw']*100:.0f}/{r['p_away']*100:.0f}"
             src = "　📜" if r.get("source") == "repo" else ""
+            det = _details.get(r["match_id"])
+            extra = ""
+            if det:
+                if det["duration"] == "EXTRA_TIME" and det["et"]:
+                    extra = f" ⏱加时 {det['et'][0]}–{det['et'][1]}"
+                elif det["duration"] == "PENALTY_SHOOTOUT" and det["pens"]:
+                    extra = f" ⚽点球 {det['pens'][0]}–{det['pens'][1]}"
             st.markdown(
-                f"{hit} **{_zh(r['home_name'])} {r['actual_home']}–{r['actual_away']} {_zh(r['away_name'])}** {sc}　"
+                f"{hit} **{_zh(r['home_name'])} {r['actual_home']}–{r['actual_away']} {_zh(r['away_name'])}**{extra} {sc}　"
                 f"<small>模型 {r['pred_home']}:{r['pred_away']}{b_mark}　"
                 f"玄学 {r['myst_home']}:{r['myst_away']}{m_mark}　胜平负 {probs_str}%{src}</small>",
                 unsafe_allow_html=True)

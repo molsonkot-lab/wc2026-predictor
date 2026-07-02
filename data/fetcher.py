@@ -264,11 +264,73 @@ def build_outright_map(outright_data: list) -> dict:
 
 
 def get_fixed_results(matches: list) -> dict:
-    """Returns {match_id: (home_goals, away_goals)} for finished matches"""
+    """
+    Returns {match_id: (home_goals, away_goals)} —— **常规90分钟比分**。
+
+    1X2 盘口、Dixon-Coles 模型、Elo、复盘统计的参照系都是常规时间。
+    football-data 的 fullTime 在加时会计入加时球、点球大战时**连点球数都
+    计入**（如 德国vs巴拉圭 常规 1-1、点球 3-4，fullTime 给 4-5）——
+    直接用会同时污染 Elo（净胜球放大）、复盘命中率和每晚市场调参。
+    加时/点球细节由 get_result_details() 单独提供。
+    """
     fixed = {}
     for m in matches:
-        if m["status"] == "FINISHED":
-            sc = m["score"]["fullTime"]
-            if sc["home"] is not None and sc["away"] is not None:
-                fixed[m["id"]] = (int(sc["home"]), int(sc["away"]))
+        if m["status"] != "FINISHED":
+            continue
+        sc = m["score"]
+        src = sc["fullTime"]
+        if sc.get("duration", "REGULAR") != "REGULAR":
+            src = sc.get("regularTime") or src
+        if src["home"] is not None and src["away"] is not None:
+            fixed[m["id"]] = (int(src["home"]), int(src["away"]))
     return fixed
+
+
+def get_result_details(matches: list) -> dict:
+    """
+    加时/点球另册记录：{match_id: {"duration", "et", "pens", "winner"}}
+    仅含非常规时间结束的已完赛场次。et = 120分钟比分，pens = 点球比分。
+    """
+    det = {}
+    for m in matches:
+        if m["status"] != "FINISHED":
+            continue
+        sc = m["score"]
+        dur = sc.get("duration", "REGULAR")
+        if dur == "REGULAR":
+            continue
+        ft = sc.get("fullTime", {})
+        pens = sc.get("penalties")
+        et = None
+        if dur == "EXTRA_TIME":
+            et = (ft.get("home"), ft.get("away"))
+        elif dur == "PENALTY_SHOOTOUT":
+            rt = sc.get("regularTime", {})
+            ex = sc.get("extraTime", {})
+            if rt.get("home") is not None and ex.get("home") is not None:
+                et = (rt["home"] + ex["home"], rt["away"] + ex["away"])
+        det[m["id"]] = {
+            "duration": dur,
+            "et": et,
+            "pens": (pens["home"], pens["away"]) if pens else None,
+            "winner": sc.get("winner"),
+        }
+    return det
+
+
+def get_ko_winners(matches: list) -> dict:
+    """
+    已完赛淘汰赛的真实晋级方：{frozenset({home_id, away_id}): winner_id}。
+    供模拟器锁定——已经踢完的淘汰赛不允许在蒙特卡洛里被"重新踢一遍"
+    （法国真实晋级了，模拟里就不能再输掉 R32），点球晋级方也以此为准。
+    """
+    winners = {}
+    for m in matches:
+        if m["status"] != "FINISHED" or m.get("stage") == "GROUP_STAGE":
+            continue
+        hid, aid = m["homeTeam"].get("id"), m["awayTeam"].get("id")
+        w = m["score"].get("winner")
+        if not hid or not aid or w not in ("HOME_TEAM", "AWAY_TEAM"):
+            continue
+        winners[frozenset((hid, aid))] = hid if w == "HOME_TEAM" else aid
+    return winners
