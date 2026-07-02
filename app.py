@@ -10,20 +10,31 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 
+# ── Streamlit Cloud 热更新自愈 ────────────────────────────────────
+# 热更新只重跑 app.py、不重新 import 模块：push 改了模块签名后，旧模块
+# 会导致 ImportError/TypeError。必须放在所有项目 from-import 之前，
+# 检测到任一旧版特征就整组 reload。
+import importlib as _il
+import inspect as _ins
+import data.fetcher as _m_fetch
+import data.predictions as _m_plog
+import models.poisson_model as _m_pm
+import models.metaphysics as _m_myst
+import models.predictor as _m_pred
+if (not hasattr(_m_fetch, "build_totals_map")
+        or not hasattr(_m_myst, "mystic_verdict_probs")
+        or "totals_pr" not in _ins.signature(_m_pred.predict_match).parameters
+        or "repo_log" not in _ins.signature(_m_plog.reconcile).parameters):
+    for _m in (_m_fetch, _m_plog, _m_pm, _m_myst, _m_pred):
+        _il.reload(_m)
+
 from config import HOST_TEAMS, WC_HOST_ADVANTAGE
 from data.fetcher import (
     fetch_wc_matches, fetch_wc_teams, fetch_match_odds, fetch_outright_odds,
-    build_odds_map, build_outright_map, get_fixed_results,
+    build_odds_map, build_outright_map, build_totals_map, get_fixed_results,
 )
 from data.players import compute_player_adjusted_elo, KEY_PLAYERS
 from data import predictions as plog
-
-# Streamlit Cloud 热更新只重跑 app.py、不重新 import 模块：push 后如果
-# 进程没重启，plog 还是旧签名会直接 TypeError。检测到旧模块就强制 reload。
-import inspect as _inspect
-if "repo_log" not in _inspect.signature(plog.reconcile).parameters:
-    import importlib as _importlib
-    plog = _importlib.reload(plog)
 from data.names import zh_name
 from data.venues import venue_city_key
 from models.elo import EloSystem
@@ -127,9 +138,10 @@ market_weight = st.sidebar.slider(
     help="0=纯模型；1=完全贴合博彩赔率。默认值由每晚自动调参(GitHub Actions)按真实战绩矫正。")
 st.sidebar.caption(f"🤖 当前自动调参建议值：{_mw_default:.2f}")
 mystic_strength = st.sidebar.slider(
-    "🔮 玄学影响力", 0.0, 1.0, 0.5, 0.1,
-    help="五行/风水/日干支大运对概率的偏置强度（纯娱乐）。默认0.5；"
-         "调到0则完全不影响统计预测。复盘中的玄学比分固定按0.5口径记录。")
+    "🔮 天命影响力", 0.0, 1.0, 0.5, 0.1,
+    help="科学模型 vs 天命的话语权分配：0=纯模型；0.5=各占一半（默认）；"
+         "1=天命完全接管，五行/日干支/风水的断言可彻底翻盘强弱。"
+         "复盘中的玄学比分固定按0.5口径记录。")
 if st.sidebar.button("🔄 刷新实时数据", use_container_width=True):
     fetch_wc_matches(force_refresh=True)
     fetch_match_odds(force_refresh=True)
@@ -145,6 +157,7 @@ with st.spinner("加载数据..."):
 
 team_map = {t["id"]: t for t in teams}
 odds_map = build_odds_map(match_odds_raw)
+totals_map = build_totals_map(match_odds_raw)
 out_map  = build_outright_map(outright_raw)
 fixed    = get_fixed_results(matches)
 
@@ -253,6 +266,7 @@ with tab_match:
         h_name, a_name = zh_name(ht), zh_name(at)
         h_name_en, a_name_en = ht.get("name", "?"), at.get("name", "?")
         odds_pr = odds_map.get(frozenset([h_name_en, a_name_en]))
+        totals_pr = totals_map.get(frozenset([h_name_en, a_name_en]))
         res = predict_match(
             home_id=ht["id"], away_id=at["id"], home_name=h_name_en, away_name=a_name_en,
             home_tla=ht.get("tla", ""), away_tla=at.get("tla", ""),
@@ -261,6 +275,7 @@ with tab_match:
             odds_weight=market_weight,          # 用自动调参后的市场权重
             goal_env=goal_env,                  # 高温/海拔进球修正
             avg_goals=_tuned["avg_goals_per_team"],  # 复盘回测出的真实进球水平
+            totals_pr=totals_pr,                # 大小球盘口锚定总进球
         )
 
         # 玄学批语：方位五行 + 真实日干支 + 承办城市风水（选了城市才计入场地）

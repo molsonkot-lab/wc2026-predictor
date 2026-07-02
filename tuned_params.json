@@ -18,6 +18,34 @@
       "map_sigma_1.5": 0.1094,
       "matrix_mode": 0.125,
       "rounded_xg": 0.1172
+    },
+    "ad_blend": 0.25,
+    "hybrid_eval": {
+      "0.0": {
+        "nll": 2.916,
+        "score_hit": 0.1562,
+        "outcome_hit": 0.5312
+      },
+      "0.25": {
+        "nll": 2.9145,
+        "score_hit": 0.1484,
+        "outcome_hit": 0.5234
+      },
+      "0.5": {
+        "nll": 2.931,
+        "score_hit": 0.1172,
+        "outcome_hit": 0.5312
+      },
+      "0.75": {
+        "nll": 2.9637,
+        "score_hit": 0.125,
+        "outcome_hit": 0.5312
+      },
+      "1.0": {
+        "nll": 3.0109,
+        "score_hit": 0.1016,
+        "outcome_hit": 0.4609
+      }
     }
   }
 }

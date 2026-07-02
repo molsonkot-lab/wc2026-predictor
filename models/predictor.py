@@ -6,7 +6,7 @@ from typing import Dict, Tuple, Optional
 from models.elo import EloSystem
 from models.poisson_model import (
     elo_to_lambdas, match_probabilities, blend_with_odds,
-    fit_lambdas_to_probs, representative_score,
+    fit_lambdas_to_probs, representative_score, total_from_market,
 )
 from data.players import get_key_players, compute_player_adjusted_elo
 import numpy as np
@@ -26,6 +26,7 @@ def predict_match(
     odds_weight: Optional[float] = None,   # market blend weight (None → config default)
     goal_env: float = 1.0,                 # heat/altitude scoring multiplier (1.0 = neutral)
     avg_goals: Optional[float] = None,     # tuned per-team goal baseline (None → config default)
+    totals_pr: Optional[Tuple[float, float]] = None,  # 大小球盘口 (line, p_over)
 ) -> Dict:
     """
     Returns a prediction dict with probabilities, expected score,
@@ -49,7 +50,16 @@ def predict_match(
     # the environment-adjusted total-goals level).
     if odds_probs and w > 0:
         p_h, p_d, p_a = blend_with_odds((p_h, p_d, p_a), odds_probs, weight=w)
-        lam, mu = fit_lambdas_to_probs(p_h, p_d, p_a, total=lam + mu)
+        total = lam + mu
+        t_conf = 0.02
+        if totals_pr:
+            # 大小球盘口给出的市场隐含总进球，与模型总进球按市场权重混合；
+            # 真实盘口定价 → 强锚定总进球（total_conf 0.02→0.5）
+            t_mkt = total_from_market(totals_pr[1], totals_pr[0])
+            total = (1 - w) * total + w * t_mkt
+            t_conf = 0.5
+        lam, mu = fit_lambdas_to_probs(p_h, p_d, p_a, total=total,
+                                       total_conf=t_conf)
 
     (ml_home, ml_away), _ = representative_score(lam, mu, (p_h, p_d, p_a))
 

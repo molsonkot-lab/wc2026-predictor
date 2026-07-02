@@ -111,7 +111,8 @@ def top_scorelines(lam: float, mu: float, rho: float = DC_RHO,
 
 
 def fit_lambdas_to_probs(p_home: float, p_draw: float, p_away: float,
-                         total: float, rho: float = DC_RHO) -> Tuple[float, float]:
+                         total: float, rho: float = DC_RHO,
+                         total_conf: float = 0.02) -> Tuple[float, float]:
     """
     Invert the Dixon-Coles model: find (lam, mu) whose W/D/L probabilities best
     match a target probability vector — the market-implied xG.
@@ -129,11 +130,13 @@ def fit_lambdas_to_probs(p_home: float, p_draw: float, p_away: float,
     """
     total0 = max(1.2, min(5.5, total))
     best, best_err = (total0 / 2, total0 / 2), float("inf")
-    # ±25% 总进球窗口 + 较强先验：1X2 赔率对总进球的信息量有限（主要在平局
+    # ±25% 总进球窗口 + 先验：1X2 赔率对总进球的信息量有限（主要在平局
     # 概率里），放太开会把败方 xG 压到 0.x，比分退化成 N:0。
+    # total_conf：总进球先验强度。默认 0.02（Elo/环境估计，软锚）；
+    # 当 total 来自真实大小球盘口时调用方应传 ~0.5（市场定价，强锚）。
     for f in (0.85, 0.925, 1.0, 1.075, 1.15, 1.25):
         t = total0 * f
-        reg = 0.02 * (f - 1.0) ** 2           # soft prior toward Elo/env total
+        reg = total_conf * (f - 1.0) ** 2     # prior toward the given total
         for i in range(25):
             w = 0.12 + (0.88 - 0.12) * i / 24
             lam = max(0.3, min(4.5, t * w))
@@ -144,6 +147,25 @@ def fit_lambdas_to_probs(p_home: float, p_draw: float, p_away: float,
             if err < best_err:
                 best_err, best = err, (lam, mu)
     return best
+
+
+def total_from_market(p_over: float, line: float = 2.5) -> float:
+    """
+    由大小球盘口反推市场隐含的总进球期望：两队进球之和 ~ Poisson(T)
+    （独立泊松之和仍是泊松），解 P(X > line) = p_over 中的 T（二分法）。
+    e.g. 2.5球盘 over 概率 55% → T ≈ 2.83。这是市场对总进球最直接的定价，
+    比只靠平局概率反推更锐利。
+    """
+    k = int(math.floor(line)) + 1        # line 2.5 → P(X ≥ 3)
+    p_over = min(0.98, max(0.02, p_over))
+    lo, hi = 0.4, 7.0
+    for _ in range(40):
+        mid = (lo + hi) / 2
+        if 1 - scipy_poisson.cdf(k - 1, mid) < p_over:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2
 
 
 # 比分点估计里 xG 锚定的强度（高斯 σ，单位：球）。σ 越小越贴近 xG，

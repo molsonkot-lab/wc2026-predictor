@@ -157,6 +157,45 @@ def evaluate(valid, fitted):
     return {k: round(v / n, 4) for k, v in hits.items()}, n
 
 
+def evaluate_hybrid(valid, fitted, raw_rows):
+    """
+    攻防能力参数(Maher/Ley 时间衰减泊松) × Elo 的几何混合，样本外评估。
+    能力参数只用每届世界杯开赛前的数据拟合（无未来函数）。
+    blend a: λ = λ_elo^(1-a) · λ_AD^a
+    """
+    from models.attack_defense import fit_abilities, ad_lambdas
+    exps, rho, bg = fitted["elo_goal_exponent"], fitted["dc_rho"], fitted["avg_goals_per_team"]
+    ab_rows = [(m["date"], m["home"], m["away"], m["hg"], m["ag"],
+                m["tour"], m["neutral"]) for m in raw_rows]
+    asof = {2018: "2018-06-14", 2022: "2022-11-20"}
+    abilities = {yr: fit_abilities(ab_rows, d) for yr, d in asof.items()}
+
+    out = {}
+    for a in (0.0, 0.25, 0.5, 0.75, 1.0):
+        nll, hit, ohit, n = 0.0, 0, 0, 0
+        for m in valid:
+            lam_e, mu_e = _lambdas(m, exps, bg)
+            ad = ad_lambdas(abilities[m["year"]], m["home"], m["away"],
+                            base_goals=bg)
+            if ad is None:
+                lam, mu = lam_e, mu_e
+            else:
+                lam = lam_e ** (1 - a) * ad[0] ** a
+                mu = mu_e ** (1 - a) * ad[1] ** a
+            M = score_matrix(lam, mu, rho)
+            nll += -math.log(max(M[m["hg"], m["ag"]], 1e-12))
+            probs = match_probabilities(lam, mu, rho)
+            (h, s_), _ = representative_score(lam, mu, probs, rho)
+            hit += ((h, s_) == (m["hg"], m["ag"]))
+            pred_o = int(np.argmax(probs))
+            act_o = 0 if m["hg"] > m["ag"] else (1 if m["hg"] == m["ag"] else 2)
+            ohit += (pred_o == act_o)
+            n += 1
+        out[a] = {"nll": round(nll / n, 4), "score_hit": round(hit / n, 4),
+                  "outcome_hit": round(ohit / n, 4)}
+    return out
+
+
 def main():
     rows = load_matches()
     wc = replay_elo(rows)
@@ -180,6 +219,20 @@ def main():
                      key=lambda k: scores[k])
     fitted["score_sigma"] = float(best_sigma.rsplit("_", 1)[1])
     fitted["valid_hit_rates"] = scores
+
+    hybrid = evaluate_hybrid(valid, fitted, rows)
+    print("\n── 攻防能力参数 × Elo 混合（样本外，a=攻防权重）──")
+    for a, r in hybrid.items():
+        print(f"  a={a:4.2f}: NLL {r['nll']}  比分命中 {r['score_hit']*100:.1f}%  "
+              f"胜平负 {r['outcome_hit']*100:.1f}%")
+    # 准入纪律：样本外 NLL 必须比纯 Elo 显著好（>0.01）才允许混入，
+    # 否则一律 a=0（2026-07 实测：攻防参数无显著增益，不准入）。
+    best_a = min(hybrid, key=lambda a: hybrid[a]["nll"])
+    if hybrid[0.0]["nll"] - hybrid[best_a]["nll"] < 0.01:
+        best_a = 0.0
+    fitted["ad_blend"] = best_a
+    fitted["hybrid_eval"] = {str(a): r for a, r in hybrid.items()}
+    print(f"  → 混合权重 a={best_a}（未过显著性门槛则强制 0）")
 
     params = {}
     if PARAMS_PATH.exists():

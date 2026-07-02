@@ -21,8 +21,13 @@ import hashlib
 from datetime import date
 from typing import Tuple, Dict
 
-# 玄学偏置上限系数：满强度(strength=1)+满bias(±1)时对胜率/xG 的最大相对偏移。
-TILT_MAX = 0.40
+# v3「天命插值」：玄学不具备概率意义，所以不再做统计学式的小偏置，
+# 而是把玄学批语升格为一套完整的"天命断言"（自己的胜平负观点、自己的比分
+# 气势），影响力滑块 strength 直接决定 科学模型 vs 天命 的话语权：
+#   0 = 纯模型；0.5 = 各占一半（默认）；1 = 天命完全接管，可彻底翻盘。
+# 所有玄学量仍由 起卦（队名/日期/场地的确定性推演）得出——同一场比赛同一天
+# 起卦结果不变，这既是占卜的本义，也避免页面每次刷新结果乱跳。
+MYSTIC_ASSERTIVENESS = 0.55   # 满 bias(±1) 时天命观点的一边倒程度
 
 WU_XING = ["金", "木", "水", "火", "土"]
 # 五行相克：key 克 value（被克方处于劣势）
@@ -272,29 +277,43 @@ def metaphysics_reading(home_name: str, away_name: str,
     }
 
 
-def apply_tilt(p_home: float, p_draw: float, p_away: float,
-               bias: float, strength: float) -> Tuple[float, float, float]:
+def mystic_verdict_probs(bias: float) -> Tuple[float, float, float]:
     """
-    按玄学 bias 与用户设定 strength（0~1）对胜平负概率施加偏置。
-    strength=0 时原样返回——真实统计预测不受任何影响。
-    bias>0 抬升主队、压低客队；平局概率按比例缩放。
+    天命观点：把玄学 bias 变成一套完整的胜平负"断言"。
+    bias=+1 → 主队气数已定（约 88/？/？ 一边倒）；bias=0 → 天意难测(均分)。
     """
-    if strength <= 0 or bias == 0:
-        return p_home, p_draw, p_away
-    shift = bias * strength * TILT_MAX   # 最多 ±40% 的相对偏移（满强度+满bias）
-    ph = max(1e-4, p_home * (1 + shift))
-    pa = max(1e-4, p_away * (1 - shift))
-    pd = max(1e-4, p_draw)
+    ph = max(0.02, min(0.94, 1 / 3 + MYSTIC_ASSERTIVENESS * bias))
+    pa = max(0.02, min(0.94, 1 / 3 - MYSTIC_ASSERTIVENESS * bias))
+    pd = max(0.04, 1.0 - ph - pa)
     tot = ph + pd + pa
     return ph / tot, pd / tot, pa / tot
 
 
+def apply_tilt(p_home: float, p_draw: float, p_away: float,
+               bias: float, strength: float) -> Tuple[float, float, float]:
+    """
+    天命插值（v3）：strength 是"科学模型 vs 天命"的话语权分配，
+    不是统计学微调。玄学侧先形成自己的完整胜平负断言
+    （mystic_verdict_probs），再与模型按 strength 线性插值：
+        strength=0 → 纯模型；1 → 天命完全接管（可彻底翻盘强弱）。
+    """
+    if strength <= 0 or bias == 0:
+        return p_home, p_draw, p_away
+    mh, md, ma = mystic_verdict_probs(bias)
+    return ((1 - strength) * p_home + strength * mh,
+            (1 - strength) * p_draw + strength * md,
+            (1 - strength) * p_away + strength * ma)
+
+
 def tilt_xg(lam: float, mu: float, bias: float, strength: float) -> Tuple[float, float]:
     """
-    按玄学 bias 与 strength 对预期进球(xG)施加偏置，用于让玄学也影响"预测比分"。
-    strength=0 时原样返回。bias>0 抬高主队进球、压低客队。
+    天命 xG（v3）：玄学侧按 bias 直接排布进球气势（总进球不变、
+    分配随天命，bias=+1 时主队独占约 95%），再与模型 xG 按 strength 插值。
     """
     if strength <= 0 or bias == 0:
         return lam, mu
-    f = bias * strength * TILT_MAX
-    return max(0.1, lam * (1 + f)), max(0.1, mu * (1 - f))
+    total = lam + mu
+    share = max(0.05, min(0.95, 0.5 + 0.45 * bias))
+    lam_m, mu_m = total * share, total * (1 - share)
+    return (max(0.1, (1 - strength) * lam + strength * lam_m),
+            max(0.1, (1 - strength) * mu + strength * mu_m))

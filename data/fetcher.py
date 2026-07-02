@@ -111,7 +111,10 @@ def fetch_team_squad(team_id: int, force_refresh: bool = False):
 
 
 def fetch_match_odds(force_refresh: bool = False):
-    key = "wc_odds_h2h"
+    # h2h + totals 同一次请求拿全（The Odds API 按 markets×regions 计费，
+    # 这里 2 credits/次、缓存1小时——大小球盘口是市场对总进球的直接定价，
+    # 用于把预测比分的总进球水平锚到市场）。
+    key = "wc_odds_h2h_totals"
     if not force_refresh:
         cached = _get_cached(key, ttl_minutes=60)
         if cached is not None:
@@ -123,7 +126,7 @@ def fetch_match_odds(force_refresh: bool = False):
             params={
                 "apiKey": ODDS_API_KEY,
                 "regions": "eu",
-                "markets": "h2h",
+                "markets": "h2h,totals",
                 "oddsFormat": "decimal",
                 "bookmakers": "pinnacle,betfair,bet365",
             },
@@ -202,6 +205,43 @@ def build_odds_map(odds_data: list) -> dict:
             odds_map[key] = (p_home, p_draw, p_away)
 
     return odds_map
+
+
+def build_totals_map(odds_data: list) -> dict:
+    """
+    Returns {frozenset({name_a, name_b}): (line, p_over)} from the totals
+    (over/under) market, de-vigged. Prefers Pinnacle, line closest to 2.5.
+    """
+    tmap = {}
+    for game in odds_data:
+        bookmakers = game.get("bookmakers", [])
+        bk = (
+            next((b for b in bookmakers if b["title"] == "Pinnacle"), None)
+            or next((b for b in bookmakers if b["title"] == "Betfair"), None)
+            or (bookmakers[0] if bookmakers else None)
+        )
+        if not bk:
+            continue
+        best = None   # (|line-2.5|, line, p_over)
+        for market in bk.get("markets", []):
+            if market["key"] != "totals":
+                continue
+            by_line = {}
+            for o in market.get("outcomes", []):
+                pt = o.get("point")
+                if pt is None or o.get("price", 0) <= 1:
+                    continue
+                by_line.setdefault(pt, {})[o["name"]] = o["price"]
+            for line, prices in by_line.items():
+                if "Over" not in prices or "Under" not in prices:
+                    continue
+                po = (1 / prices["Over"]) / (1 / prices["Over"] + 1 / prices["Under"])
+                cand = (abs(line - 2.5), line, po)
+                if best is None or cand < best:
+                    best = cand
+        if best:
+            tmap[frozenset([game["home_team"], game["away_team"]])] = (best[1], best[2])
+    return tmap
 
 
 def build_outright_map(outright_data: list) -> dict:
