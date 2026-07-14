@@ -2,7 +2,7 @@
   "market_weight": 1.0,
   "n_samples": 20,
   "logloss": 0.7805,
-  "updated_at": "2026-07-13T09:24:50.323436+00:00",
+  "updated_at": "2026-07-14T08:02:48.649342+00:00",
   "backtest": {
     "avg_goals_per_team": 1.242,
     "elo_goal_exponent": 0.7,
